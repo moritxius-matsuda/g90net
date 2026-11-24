@@ -976,6 +976,8 @@ class Net:
         self.started = 0.0
         self.welcomed = set()     # IMSIs, die in dieser Netz-Session schon begruesst wurden
         self.dev_gsm = self.dev_lte = ""
+        self.cmds = {}            # tag -> (binary, args, gruppe) fuer Einzel-Neustarts
+        self.busy = ""            # laufender Teil-Neustart
 
     def _log(self, tag, line):
         line = line.rstrip()
@@ -997,10 +999,11 @@ class Net:
         if self.procs.get(tag) is p and self.state == "laeuft" and tag not in GSM_NONFATAL:
             self.msg = f"{tag} beendet (Code {rc}) - siehe Protokoll"
 
-    def _spawn(self, binary, args, tag):
+    def _spawn(self, binary, args, tag, group=""):
         p = subprocess.Popen([binary] + args, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, bufsize=1)
         self.procs[tag] = p
+        self.cmds[tag] = (binary, args, group or self.cmds.get(tag, ("", [], ""))[2])
         threading.Thread(target=self._reader, args=(p, tag), daemon=True).start()
         return p
 
@@ -1009,6 +1012,7 @@ class Net:
             if FAKE:
                 self.tech = None; self.state = "aus"; self.procs = {}; return
             procs, self.procs = self.procs, {}
+            self.cmds = {}
             for tag, p in list(procs.items()):
                 try: p.terminate()
                 except Exception: pass
@@ -1031,7 +1035,13 @@ class Net:
             with self.lock: self.tech = None; self.state = "fehler"; self.msg = err
             return err
         if FAKE:
-            with self.lock: self.state = "laeuft"; self.msg = MODES[mode] + " laeuft (FAKE)"
+            with self.lock:
+                self.state = "laeuft"; self.msg = MODES[mode] + " laeuft (FAKE)"
+                if mode in ("gsm", "csfb"):
+                    for n, b, _c in gsm_components(): self.cmds[n] = (b, [], "gsm")
+                if mode in ("lte", "csfb"):
+                    for n, b in O5_NFS: self.cmds[n] = (b, [], "lte")
+                    self.cmds["enb"] = ("srsenb", [], "lte")
             return None
         gsm, lte = mode in ("gsm", "csfb"), mode in ("lte", "csfb")
         try:
@@ -1048,24 +1058,103 @@ class Net:
             if self.dev_gsm: self._log("pkom", "GSM-Funk: " + lime_label(self.dev_gsm))
             if self.dev_lte: self._log("pkom", "LTE-Funk: " + lime_label(self.dev_lte))
             _lime_service("stop"); time.sleep(1); _free_lime(); time.sleep(2)
-            if gsm:
-                for name, binary, cfg in gsm_components():
-                    flag = "-C" if binary.startswith("osmo-trx") else "-c"
-                    self._spawn(binary, [flag, os.path.join(WORKDIR, cfg)], name)
-                    time.sleep(4 if name in ("trx",) else 1.2)
-                time.sleep(1); gsm_apply_numbers()   # SIMs + dauerhafte Rufnummern ins HLR
-            if lte:
-                ue_net_up()
-                for nf, (binary, path) in nfs.items():
-                    self._spawn(binary, ["-c", path], nf)
-                    time.sleep(1.5 if nf == "mme" else 0.8)
-                time.sleep(2)
-                self._spawn("srsenb", [os.path.join(WORKDIR, "enb.conf")], "enb")
+            if gsm: self._run_gsm()
+            if lte: self._run_lte(nfs)
             with self.lock: self.state = "laeuft"; self.msg = MODES[mode] + " gestartet"
         except Exception as e:
             with self.lock: self.state = "fehler"; self.msg = str(e)[:200]
             return str(e)
         return None
+
+    # ---- Teile starten / einzeln neu starten ----------------------------
+    def _run_gsm(self):
+        for name, binary, cfg in gsm_components():
+            flag = "-C" if binary.startswith("osmo-trx") else "-c"
+            self._spawn(binary, [flag, os.path.join(WORKDIR, cfg)], name, "gsm")
+            time.sleep(4 if name in ("trx",) else 1.2)
+        time.sleep(1); gsm_apply_numbers()   # SIMs + dauerhafte Rufnummern ins HLR
+
+    def _run_lte(self, nfs, core=True):
+        if core:
+            ue_net_up()
+            for nf, (binary, path) in nfs.items():
+                self._spawn(binary, ["-c", path], nf, "lte")
+                time.sleep(1.5 if nf == "mme" else 0.8)
+            time.sleep(2)
+        self._spawn("srsenb", [os.path.join(WORKDIR, "enb.conf")], "enb", "lte")
+
+    def _kill(self, tags):
+        """Prozesse beenden, ohne dass der Leser 'beendet' meldet."""
+        ps = [(t, self.procs.pop(t)) for t in list(tags) if t in self.procs]
+        for _t, p in ps:
+            try: p.terminate()
+            except Exception: pass
+        for _t, p in ps:
+            try: p.wait(timeout=6)
+            except Exception:
+                try: p.kill(); p.wait(timeout=3)
+                except Exception: pass
+
+    def parts(self):
+        """Was einzeln neu gestartet werden kann (je nach Modus)."""
+        t = self.tech or ""
+        out = []
+        if t in ("gsm", "csfb"): out.append(("gsm", "GSM komplett"))
+        if t in ("lte", "csfb"): out += [("lte", "4G komplett"), ("enb", "4G-Funk (eNB)")]
+        return out
+
+    def restart(self, part):
+        """part: 'gsm' | 'lte' | 'core' | 'enb' | Prozessname (z.B. 'msc', 'mme')."""
+        with self.lock:
+            if self.state not in ("laeuft", "fehler") or not self.tech:
+                return "Netz laeuft nicht"
+            if self.busy: return f"Neustart von {self.busy} laeuft noch"
+            gsm, lte = self.tech in ("gsm", "csfb"), self.tech in ("lte", "csfb")
+            if part == "gsm" and not gsm or part in ("lte", "enb") and not lte:
+                return "Teil ist im aktuellen Modus nicht aktiv"
+            if part not in ("gsm", "lte", "enb") and part not in self.cmds:
+                return f"unbekannter Teil '{part}'"
+            self.busy = part
+        label = dict(self.parts()).get(part, part)
+        self._log("pkom", f"Neustart: {label}")
+        self.msg = f"{label} startet neu ..."
+        try:
+            if FAKE:
+                time.sleep(0.5)
+            elif part == "gsm":
+                self._kill([t for t, c in self.cmds.items() if c[2] == "gsm"])
+                gsm_prepare(); self._run_gsm()
+            elif part == "lte":
+                self._kill([t for t, c in self.cmds.items() if c[2] == "lte"])
+                nfs = o5_prepare(self.tech == "csfb")
+                enb_prepare(self.tech == "csfb", self.dev_lte)
+                e = hss_sync_all()
+                if e: self._log("pkom", "HSS: " + e)
+                self._run_lte(nfs)
+            elif part == "enb":
+                self._kill(["enb"]); enb_prepare(self.tech == "csfb", self.dev_lte)
+                self._run_lte({}, core=False)
+            else:
+                binary, args, grp = self.cmds[part]
+                self._kill([part]); time.sleep(0.5)
+                self._spawn(binary, args, part, grp)
+                if part == "hlr": time.sleep(1.5); gsm_apply_numbers()
+            with self.lock: self.state = "laeuft"; self.msg = f"{label} neu gestartet"
+            return None
+        except Exception as e:
+            with self.lock: self.msg = f"Neustart {label} fehlgeschlagen: {str(e)[:160]}"
+            return str(e)
+        finally:
+            self.busy = ""
+
+    def proc_list(self):
+        out = []
+        for tag, (_b, _a, grp) in self.cmds.items():
+            p = self.procs.get(tag)
+            rc = None if p is None else p.poll()
+            out.append({"tag": tag, "group": grp, "run": p is not None and rc is None,
+                        "rc": rc if p is not None else "-"})
+        return out
 
     # Kompatibilitaet
     def start_gsm(self): return self.start("gsm")
@@ -1103,6 +1192,8 @@ class Net:
                 "tz": "UTC%+d:%02d%s" % (tz_now()[0], tz_now()[1], " +Sommerzeit" if tz_now()[2] else ""),
                 "clash": freq_clash(),
                 "fake": FAKE,
+                "parts": [{"id": i, "name": n} for i, n in self.parts()],
+                "procs": self.proc_list(), "busy": self.busy,
             }
         return st
 
@@ -1121,6 +1212,10 @@ def handle_api(path, body):
         NET.start(cmd[6:])
     elif cmd == "stop":
         NET.stop()
+    elif cmd == "restart":
+        part = re.sub(r"[^a-z0-9_-]", "", str(req.get("part", "")).lower())
+        err = NET.restart(part)
+        if err: NET.msg = err
     elif cmd == "lime_scan":
         n = len(lime_scan()); NET.msg = f"{n} LimeSDR gefunden"
     elif cmd == "set":
@@ -1224,7 +1319,7 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
 .empty{color:var(--mut2);font-size:13px;padding:8px 0}
 .log{background:#030a18;border:1px solid var(--line);padding:14px;font:12px/1.55 var(--mono);height:440px;overflow:auto;white-space:pre-wrap;color:#9fb3d0}
 .toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px}.toolbar input{flex:1}
-.ef{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}.ef th{text-align:left;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.07em;padding:8px 6px;border-bottom:1px solid var(--line2)}.ef td{padding:10px 6px;border-bottom:1px solid var(--line);vertical-align:top}.ef code{font-family:var(--mono);color:var(--acc);word-break:break-all;user-select:all}.mut{color:var(--mut);font-size:11px}.genwrap{overflow-x:auto;margin-top:12px}.genwrap .ef td,.genwrap .ef th{white-space:nowrap}.genwrap code{font-size:12px}.btn:disabled{opacity:.4;cursor:default}code{font-family:var(--mono)}@media(max-width:560px){.row,.row3{grid-template-columns:1fr}}
+.ef{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}.ef th{text-align:left;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.07em;padding:8px 6px;border-bottom:1px solid var(--line2)}.ef td{padding:10px 6px;border-bottom:1px solid var(--line);vertical-align:top}.ef code{font-family:var(--mono);color:var(--acc);word-break:break-all;user-select:all}.mut{color:var(--mut);font-size:11px}.genwrap{overflow-x:auto;margin-top:12px}.genwrap .ef td,.genwrap .ef th{white-space:nowrap}.genwrap code{font-size:12px}.btn:disabled{opacity:.4;cursor:default}.procs{display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:6px;margin-top:12px}.proc{display:flex;align-items:center;justify-content:space-between;gap:6px;border:1px solid var(--line);border-radius:8px;padding:4px 4px 4px 8px;font-size:12px}.proc .pd{width:8px;height:8px;border-radius:50%;background:var(--err);flex:none}.proc .pd.on{background:var(--ok)}.proc span{flex:1;overflow:hidden;text-overflow:ellipsis}.proc button{border:0;background:transparent;color:var(--mut);cursor:pointer;font-size:15px;padding:2px 6px;border-radius:6px}.proc button:hover{color:var(--fg);background:var(--line)}code{font-family:var(--mono)}@media(max-width:560px){.row,.row3{grid-template-columns:1fr}}
 </style></head><body>
 <header>
  <div class=brand><svg xmlns="http://www.w3.org/2000/svg" viewBox="-20 -20 668 330" role="img" aria-label="pKOM"><g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="32"><g stroke="#FFFFFF"><path d="M20 80 V266"></path><circle cx="72" cy="133" r="52"></circle><path d="M178 16 Q206 100 178 184"></path><path d="M192 100 C226 96 250 62 266 16"></path><path d="M492 184 V30 C522 30 534 106 552 106 C570 106 582 30 612 30 V184"></path></g><path stroke="#2EC4F1" d="M192 100 C233 102 256 183 363 183 A83 83 0 0 0 363 17 A83 83 0 0 0 282 118"></path></g></svg><span class=prod>Netzsteuerung</span></div>
@@ -1266,6 +1361,13 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
     <div class=hint id=uptimehint></div>
     <div class=hint id=devhint></div>
     <div class=hint id=clash style=color:var(--err)></div>
+   </div>
+   <div class=card>
+    <h2>Neustarten</h2>
+    <p class=sub>Einzelne Teile neu starten, ohne das ganze Netz anzuhalten. Konfiguration wird dabei neu geschrieben.</p>
+    <div id=parts style=display:flex;gap:8px;flex-wrap:wrap></div>
+    <div id=procs class=procs></div>
+    <div class=hint id=parthint>Startet, sobald ein Netz läuft.</div>
    </div>
    <div class=card>
     <h2>Funk-Hardware</h2>
@@ -1491,8 +1593,15 @@ function render(s){S=s;limeOptions(s);if(!filled)reloadFields();
  $('gsm_numbers').innerHTML=Object.entries(s.gsm.numbers||{}).map(e=>'<div class=listrow><span class=tag>'+esc(e[0])+' → <b>'+esc(e[1])+'</b></span><button class=x onclick="numdel(\''+esc(e[0])+'\')">löschen</button></div>').join('')||'<div class=empty>keine Zuweisungen</div>';
  $('attached').innerHTML=(s.gsm.attached||[]).map(i=>'<div class=listrow><span class=tag>'+esc(i)+'</span><span class=tag>'+esc((s.gsm.numbers||{})[i]||'')+'</span></div>').join('')||'<div class=empty>keine eingebucht</div>';
  $('sims').innerHTML=(s.sims||[]).map(x=>'<div class=listrow><span class=tag>'+esc(x.imsi)+' · <b>'+esc(x.msisdn)+'</b></span><button class=x onclick="simdel(\''+esc(x.imsi)+'\')">löschen</button></div>').join('')||'<div class=empty>noch keine SIM eingetragen</div>';
+ renderParts(s);
  renderlog();
 }
+let partKey='';
+function restart(p,label){if(S.busy)return;if(!confirm((label||p)+' neu starten?'))return;$('msg').textContent=(label||p)+' startet neu…';api('restart',{part:p}).then(render);}
+function renderParts(s){const P=s.parts||[],L=s.procs||[],key=JSON.stringify([P,L.map(x=>[x.tag,x.run]),s.busy]);if(key===partKey)return;partKey=key;
+ $('parts').innerHTML=P.map(x=>'<button class="btn sec" '+(s.busy?'disabled':'')+' onclick="restart(\''+x.id+'\',\''+esc(x.name)+'\')">↻ '+esc(x.name)+'</button>').join('');
+ $('procs').innerHTML=L.map(x=>'<div class=proc title="'+esc(x.group.toUpperCase())+(x.run?' · läuft':' · beendet (Code '+esc(x.rc)+')')+'"><i class="pd'+(x.run?' on':'')+'"></i><span>'+esc(x.tag)+'</span><button '+(s.busy?'disabled':'')+' onclick="restart(\''+esc(x.tag)+'\')" aria-label="'+esc(x.tag)+' neu starten">↻</button></div>').join('');
+ $('parthint').textContent=s.busy?('Neustart läuft: '+s.busy):(P.length?'Grün = läuft, rot = beendet. ↻ startet nur diesen Prozess neu.':'Startet, sobald ein Netz läuft.');}
 let GEN=[];
 function simgen(){api('sim_gen',{count:$('gen_n').value,msisdn:$('gen_nr').value,iccid:$('gen_iccid').value}).then(r=>{GEN=r.generated||[];gendraw();render(r);});}
 const GCOLS=[['iccid','ICCID'],['imsi','IMSI'],['ki','Ki'],['op','OP'],['opc','OPc'],['msisdn','Rufnr.'],['pin1','PIN1'],['puk1','PUK1'],['pin2','PIN2'],['puk2','PUK2'],['adm1','ADM1']];
