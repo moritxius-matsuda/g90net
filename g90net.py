@@ -880,7 +880,8 @@ def enb_prepare(csfb, serial):
     t = re.sub(r"(?m)^(\s*dl_earfcn\s*=\s*)\d+;", r"\g<1>%d;" % earfcn, t, count=1)  # 1. = eigene Zelle
     open(rr, "w").write(t)
     sib = os.path.join(WORKDIR, "sib.conf")
-    open(sib, "w").write(sib_patch(open(sib).read(), csfb, int(C["GSM_ARFCN"])))
+    with open(sib) as f: t = f.read()          # erst lesen - open(...,"w") leert die Datei sofort
+    with open(sib, "w") as f: f.write(sib_patch(t, csfb, int(C["GSM_ARFCN"])))
     dev = "driver=lime" + (",serial=" + serial if serial else "")
     open(os.path.join(WORKDIR, "enb.conf"), "w").write(f"""# pKOM - automatisch erzeugt
 [enb]
