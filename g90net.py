@@ -10,7 +10,7 @@
 #       Ein offenes Netz ohne Authentisierung = IMSI-Catcher, wenn es
 #       abstrahlt. Nur eigene Test-SIMs. Testkennung 001/01 oder 999/99.
 # =====================================================================
-import os, re, sys, json, time, shutil, socket, threading, subprocess
+import os, re, sys, json, time, shutil, socket, secrets, threading, subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ------------------------------------------------------------------ Konfig
@@ -547,6 +547,91 @@ def gsm_num_del(imsi):
     if not FAKE and gsm_on():
         vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} update msisdn "])
 
+# ---- SIM-Daten erzeugen (fuer eigene eSIM-Profile, z.B. simlessly)
+# IMSI = eigene Kennung (MCC+MNC) + zufaellige MSIN, Ki/OP zufaellig (secrets),
+# OPc = AES_Ki(OP) xor OP (Milenage, TS 35.206), ICCID mit Luhn-Pruefziffer.
+_SBOX = []
+def _aes_tables():
+    if _SBOX: return
+    p = q = 1; sb = [0] * 256
+    while True:                                    # S-Box ueber das Inverse in GF(2^8)
+        p = p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)
+        q ^= q << 1; q ^= q << 2; q ^= q << 4; q &= 0xFF
+        if q & 0x80: q ^= 0x09
+        x = q ^ ((q << 1 | q >> 7) & 0xFF) ^ ((q << 2 | q >> 6) & 0xFF) \
+              ^ ((q << 3 | q >> 5) & 0xFF) ^ ((q << 4 | q >> 4) & 0xFF)
+        sb[p] = x ^ 0x63
+        if p == 1: break
+    sb[0] = 0x63
+    _SBOX.extend(sb)
+
+def _xt(a): return ((a << 1) ^ 0x1B) & 0xFF if a & 0x80 else a << 1
+
+def aes128_encrypt(key, block):
+    """AES-128, ein Block (reines Python, nur fuer die OPc-Berechnung)."""
+    _aes_tables(); S = _SBOX
+    w = [list(key[i:i + 4]) for i in range(0, 16, 4)]; rc = 1
+    for i in range(4, 44):
+        t = list(w[i - 1])
+        if i % 4 == 0:
+            t = [S[b] for b in t[1:] + t[:1]]; t[0] ^= rc; rc = _xt(rc)
+        w.append([a ^ b for a, b in zip(w[i - 4], t)])
+    s = [b ^ k for b, k in zip(block, sum(w[0:4], []))]
+    for r in range(1, 11):
+        s = [S[b] for b in s]
+        s = [s[((c + i) % 4) * 4 + i] for c in range(4) for i in range(4)]     # ShiftRows
+        if r < 10:
+            m = []
+            for c in range(4):
+                a = s[c * 4:c * 4 + 4]; t = a[0] ^ a[1] ^ a[2] ^ a[3]
+                m += [a[i] ^ t ^ _xt(a[i] ^ a[(i + 1) % 4]) for i in range(4)]
+            s = m
+        s = [b ^ k for b, k in zip(s, sum(w[r * 4:r * 4 + 4], []))]
+    return bytes(s)
+
+def milenage_opc(k_hex, op_hex):
+    k, op = bytes.fromhex(k_hex), bytes.fromhex(op_hex)
+    return bytes(a ^ b for a, b in zip(aes128_encrypt(k, op), op)).hex().upper()
+
+def luhn(digits):
+    tot = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2 == 0:
+            d *= 2
+            if d > 9: d -= 9
+        tot += d
+    return str((10 - tot % 10) % 10)
+
+def _rand_digits(n):
+    return "".join(str(secrets.randbelow(10)) for _ in range(n))
+
+def sim_generate(count=1, msisdn_start="", iccid_prefix=""):
+    mcc, mnc = C.get("MCC", "001"), C.get("MNC", "01")
+    count = max(1, min(50, int(count or 1)))
+    used = set(sims_load()) | set(nums_load())
+    taken_nr = set(nums_load().values()) | {s.get("msisdn", "") for s in sims_load().values()}
+    nr = int(re.sub(r"\D", "", msisdn_start or "") or 0)
+    pref = re.sub(r"\D", "", iccid_prefix or "") or ("89" + mcc + mnc)
+    pref = pref[:16]
+    out = []
+    while len(out) < count:
+        imsi = mcc + mnc + _rand_digits(15 - len(mcc) - len(mnc))
+        if imsi in used: continue
+        used.add(imsi)
+        ki = secrets.token_hex(16).upper(); op = secrets.token_hex(16).upper()
+        body = pref + _rand_digits(18 - len(pref))
+        msisdn = ""
+        if nr:
+            while str(nr) in taken_nr: nr += 1
+            msisdn = str(nr); taken_nr.add(msisdn); nr += 1
+        out.append({"iccid": body + luhn(body), "imsi": imsi, "ki": ki, "op": op,
+                    "opc": milenage_opc(ki, op), "amf": "8000", "sqn": "000000000020",
+                    "msisdn": msisdn, "pin1": "0000", "puk1": _rand_digits(8),
+                    "pin2": "0000", "puk2": _rand_digits(8), "adm1": _rand_digits(8),
+                    "spn": C.get("SPN") or C.get("NETNAME", ""), "hplmn": mcc + mnc})
+    return out
+
 # ---- SIM-Dateien fuer das eSIM-Profil (OPL / PNN / SPN)
 # Diese drei Dateien liegen auf der SIM, nicht im Netz. pKOM berechnet die Werte
 # passend zu Kennung + Netzname; sie werden im eSIM-Profil eingetragen.
@@ -1047,6 +1132,14 @@ def handle_api(path, body):
         NET.msg = gsm_sim_nr(req.get("imsi",""), req.get("msisdn","")) or "Rufnummer dauerhaft zugewiesen"
     elif cmd == "gsm_num_del":
         gsm_num_del(req.get("imsi","")); NET.msg = "Rufnummer-Zuweisung geloescht"
+    elif cmd == "sim_gen":
+        try:
+            gen = sim_generate(req.get("count", 1), req.get("msisdn", ""), req.get("iccid", ""))
+            NET.msg = f"{len(gen)} SIM-Datensatz/-saetze erzeugt"
+        except Exception as e:
+            gen = []; NET.msg = "Erzeugen fehlgeschlagen: %s" % e
+        st = NET.status(); st["generated"] = gen
+        return st
     elif cmd == "sms_test":
         NET.msg = sms_test(req.get("imsi",""), req.get("text",""))
     else:
@@ -1121,7 +1214,7 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
 .empty{color:var(--mut2);font-size:13px;padding:8px 0}
 .log{background:#030a18;border:1px solid var(--line);padding:14px;font:12px/1.55 var(--mono);height:440px;overflow:auto;white-space:pre-wrap;color:#9fb3d0}
 .toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px}.toolbar input{flex:1}
-.ef{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}.ef th{text-align:left;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.07em;padding:8px 6px;border-bottom:1px solid var(--line2)}.ef td{padding:10px 6px;border-bottom:1px solid var(--line);vertical-align:top}.ef code{font-family:var(--mono);color:var(--acc);word-break:break-all;user-select:all}.mut{color:var(--mut);font-size:11px}code{font-family:var(--mono)}@media(max-width:560px){.row,.row3{grid-template-columns:1fr}}
+.ef{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}.ef th{text-align:left;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.07em;padding:8px 6px;border-bottom:1px solid var(--line2)}.ef td{padding:10px 6px;border-bottom:1px solid var(--line);vertical-align:top}.ef code{font-family:var(--mono);color:var(--acc);word-break:break-all;user-select:all}.mut{color:var(--mut);font-size:11px}.genwrap{overflow-x:auto;margin-top:12px}.genwrap .ef td,.genwrap .ef th{white-space:nowrap}.genwrap code{font-size:12px}.btn:disabled{opacity:.4;cursor:default}code{font-family:var(--mono)}@media(max-width:560px){.row,.row3{grid-template-columns:1fr}}
 </style></head><body>
 <header>
  <div class=brand><svg xmlns="http://www.w3.org/2000/svg" viewBox="-20 -20 668 330" role="img" aria-label="pKOM"><g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="32"><g stroke="#FFFFFF"><path d="M20 80 V266"></path><circle cx="72" cy="133" r="52"></circle><path d="M178 16 Q206 100 178 184"></path><path d="M192 100 C226 96 250 62 266 16"></path><path d="M492 184 V30 C522 30 534 106 552 106 C570 106 582 30 612 30 V184"></path></g><path stroke="#2EC4F1" d="M192 100 C233 102 256 183 363 183 A83 83 0 0 0 363 17 A83 83 0 0 0 282 118"></path></g></svg><span class=prod>Netzsteuerung</span></div>
@@ -1269,6 +1362,23 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
  </div>
 
  <div class=panel id=p-sims>
+  <div class="card" style="margin-bottom:16px">
+   <h2>SIM-Daten erzeugen</h2>
+   <p class=sub>Für eigene eSIM-Profile (z.&nbsp;B. simlessly): IMSI passend zur Kennung, zufällige Schlüssel (Ki, OP → OPc nach Milenage), ICCID mit Prüfziffer, PIN/PUK/ADM. Bleibt nur im Browser, bis du es übernimmst.</p>
+   <div class=row3>
+    <div><label>Anzahl (1–50)</label><input id=gen_n type=number min=1 max=50 value=1></div>
+    <div><label>Erste Rufnummer (leer = keine)</label><input id=gen_nr inputmode=numeric placeholder="z. B. 9201"></div>
+    <div><label>ICCID-Präfix (leer = 89+MCC+MNC)</label><input id=gen_iccid inputmode=numeric></div>
+   </div>
+   <div style=display:flex;gap:8px;flex-wrap:wrap>
+    <button class=btn onclick="simgen()">Erzeugen</button>
+    <button class="btn sec" id=gen_take onclick="gentake()" disabled>Alle in pKOM übernehmen</button>
+    <button class="btn sec" id=gen_csv onclick="gendl('csv')" disabled>CSV</button>
+    <button class="btn sec" id=gen_json onclick="gendl('json')" disabled>JSON</button>
+   </div>
+   <div class=genwrap><table class=ef id=gen_tab></table></div>
+   <p class=hint>AMF 8000, SQN-Start 000000000020, Algorithmus Milenage. Im eSIM-Profil die IMSI, Ki und OPc (oder OP) eintragen; dazu SPN/PNN/OPL aus dem Tab „SIM-Profil“.</p>
+  </div>
   <div class=grid>
    <div class=card>
     <h2>SIM eintragen</h2>
@@ -1373,6 +1483,19 @@ function render(s){S=s;limeOptions(s);if(!filled)reloadFields();
  $('sims').innerHTML=(s.sims||[]).map(x=>'<div class=listrow><span class=tag>'+esc(x.imsi)+' · <b>'+esc(x.msisdn)+'</b></span><button class=x onclick="simdel(\''+esc(x.imsi)+'\')">löschen</button></div>').join('')||'<div class=empty>noch keine SIM eingetragen</div>';
  renderlog();
 }
+let GEN=[];
+function simgen(){api('sim_gen',{count:$('gen_n').value,msisdn:$('gen_nr').value,iccid:$('gen_iccid').value}).then(r=>{GEN=r.generated||[];gendraw();render(r);});}
+const GCOLS=[['iccid','ICCID'],['imsi','IMSI'],['ki','Ki'],['op','OP'],['opc','OPc'],['msisdn','Rufnr.'],['pin1','PIN1'],['puk1','PUK1'],['pin2','PIN2'],['puk2','PUK2'],['adm1','ADM1']];
+function gendraw(){const T=$('gen_tab');
+ T.innerHTML=GEN.length?'<tr>'+GCOLS.map(c=>'<th>'+c[1]+'</th>').join('')+'<th></th></tr>'+GEN.map((g,i)=>'<tr>'+GCOLS.map(c=>'<td><code>'+esc(g[c[0]])+'</code></td>').join('')+'<td><button class="btn sm sec" onclick="gentake('+i+')">übernehmen</button></td></tr>').join(''):'';
+ ['gen_take','gen_csv','gen_json'].forEach(id=>$(id).disabled=!GEN.length);}
+async function gentake(i){const L=i===undefined?GEN:[GEN[i]];let ok=0,last=null;
+ for(const g of L){last=await api('sim_add',{imsi:g.imsi,ki:g.ki,opc:g.opc,msisdn:g.msisdn});if(!/aber|pruefen/.test(last.msg||''))ok++;}
+ if(last){render(last);$('msg').textContent=ok+' von '+L.length+' SIM(s) in pKOM übernommen'+(ok<L.length?' – '+last.msg:'');}}
+function gendl(fmt){if(!GEN.length)return;let data,type,name='pkom-sims-'+new Date().toISOString().slice(0,10);
+ if(fmt==='json'){data=JSON.stringify(GEN,null,1);type='application/json';name+='.json';}
+ else{const k=Object.keys(GEN[0]);data=[k.join(';')].concat(GEN.map(g=>k.map(x=>g[x]).join(';'))).join(String.fromCharCode(13,10));type='text/csv';name+='.csv';}
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data],{type}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);}
 async function poll(){try{render(await api('status'));}catch(e){}}
 try{const t=localStorage.getItem('pkom_tab');if(t&&$('p-'+t))tab(t);}catch(e){}
 poll();setInterval(poll,2500);
