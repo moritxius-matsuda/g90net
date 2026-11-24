@@ -198,10 +198,12 @@ for f in osmo-stp.cfg osmo-hlr.cfg osmo-msc.cfg osmo-bsc.cfg osmo-bts-trx.cfg os
   fi
 done
 # srsRAN: Beispielkonfigs nachziehen
-for f in enb.conf rr.conf sib.conf rb.conf epc.conf; do
-  if [[ ! -f /etc/srsran/$f ]]; then
-    src=$(find /usr/local/share/srsran /usr/share/srsran /usr/share/doc -name "$f*" 2>/dev/null | grep -iE 'srs|enb|epc' | head -1)
-    [[ -n "$src" ]] && cp "$src" /etc/srsran/$f 2>/dev/null || true
+for f in enb.conf rr.conf sib.conf rb.conf; do
+  # leere oder fehlende Datei durch die mitgelieferte Vorlage ersetzen (genauer Name, nicht *.mbsfn.*)
+  if [[ ! -s /etc/srsran/$f ]]; then
+    for src in /usr/local/share/srsran/$f.example /usr/share/srsran/$f.example; do
+      [[ -s $src ]] && { cp "$src" /etc/srsran/$f; break; }
+    done
   fi
 done
 

@@ -803,10 +803,19 @@ def o5_prepare(csfb, etc=O5_ETC, outdir=O5_DIR):
         out[nf] = (binary, dst)
     return out
 
+SRS_MARK = {"sib.conf": r"(?m)^sib1\s*=", "rr.conf": r"(?m)^cell_list\s*=", "rb.conf": r"(?m)^\w+\s*="}
+
 def _srs_template(name):
-    for p in (os.path.join(SRS_CFG, name), f"/usr/share/srsran/{name}.example",
-              f"/usr/share/srsran/{name}", f"/usr/local/share/srsran/{name}.example", f"/usr/share/doc/srsran/examples/{name}.example"):
-        if os.path.isfile(p): return p
+    """Vorlage suchen - nur Dateien, die wirklich den erwarteten Inhalt haben
+    (eine leere/falsche /etc/srsran/sib.conf fuehrte zu 'section sib1 not found')."""
+    cands = (os.path.join(SRS_CFG, name), f"/usr/local/share/srsran/{name}.example",
+             f"/usr/share/srsran/{name}.example", f"/usr/share/srsran/{name}",
+             f"/usr/share/doc/srsran/examples/{name}.example")
+    for p in cands:
+        try: t = open(p, encoding="utf-8", errors="replace").read()
+        except OSError: continue
+        if re.search(SRS_MARK.get(name, r"\S"), t): return p
+        log(f"srsRAN-Vorlage {p} unbrauchbar - uebersprungen")
     return None
 
 def _drop_block(t, name):
