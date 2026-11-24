@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Laufzeitdaten / lokale Konfig (gehoeren nicht ins Repo)
+numbers.json
+*.conf
+work/
+*.log
