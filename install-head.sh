@@ -20,6 +20,7 @@
 # Kein 'set -e': der Installer besteht aus vielen Best-Effort-Schritten (Pakete, Konfigs
 # nachziehen, NAT). Kritische Schritte sind unten explizit mit 'die' abgesichert.
 set -u
+SELF=$(readlink -f "$0")
 
 CONF=/etc/g90net.conf
 APPDIR=/opt/g90net
@@ -81,24 +82,35 @@ apt-get install -y -qq srsran 2>/dev/null || true
 if ! command -v srsenb >/dev/null 2>&1; then
   info "srsRAN 4G aus dem Quelltext bauen (einmalig, bitte warten)"
   apt-get install -y -qq build-essential cmake git pkg-config libfftw3-dev libmbedtls-dev     libboost-program-options-dev libconfig++-dev libsctp-dev libsoapysdr-dev 2>/dev/null     || warn "Build-Pakete fuer srsRAN unvollstaendig"
-  SRC=/usr/local/src/srsRAN_4G
+  SRC=/usr/local/src/srsRAN_4G; LOG=/var/log/pkom-srsran-build.log
   if [[ -d $SRC/.git ]]; then git -C $SRC pull -q --ff-only || true
   else git clone -q --depth 1 https://github.com/srsran/srsRAN_4G.git $SRC || warn "srsRAN-Quelltext nicht ladbar"; fi
   if [[ -d $SRC ]]; then
-    MEMG=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1048576 ))
-    J=$(nproc); (( J > MEMG / 2 )) && J=$(( MEMG / 2 )); (( J < 1 )) && J=1
-    mkdir -p $SRC/build && cd $SRC/build
-    if cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_WERROR=OFF -DENABLE_UHD=OFF -DENABLE_BLADERF=OFF          -DENABLE_ZEROMQ=OFF -DENABLE_SOAPYSDR=ON -DENABLE_RF_PLUGINS=ON >/tmp/srsran-build.log 2>&1        && make -j"$J" srsenb >>/tmp/srsran-build.log 2>&1 && make -j"$J" >>/tmp/srsran-build.log 2>&1        ; then
-      make install >>/tmp/srsran-build.log 2>&1 && ldconfig
-      grep -q "SoapySDR" /tmp/srsran-build.log || warn "srsRAN ohne SoapySDR gebaut - LimeSDR fehlt (libsoapysdr-dev?)"
-    else
-      # Tests duerfen scheitern, solange srsenb selbst gebaut ist
-      [[ -x srsenb/src/srsenb ]] && { make install >>/tmp/srsran-build.log 2>&1 || cp srsenb/src/srsenb /usr/local/bin/; ldconfig; }         || warn "srsRAN-Build fehlgeschlagen - siehe /tmp/srsran-build.log"
+    MEMK=$(awk '/MemTotal/{print $2}' /proc/meminfo); SWAPK=$(awk '/SwapTotal/{print $2}' /proc/meminfo)
+    TMPSWAP=""
+    # Die grossen ASN.1-Dateien brauchen je Compiler ~2 GB RAM -> bei wenig Speicher Auslagerung anlegen
+    if (( MEMK + SWAPK < 8000000 )); then
+      TMPSWAP=/var/tmp/pkom-build.swap
+      info "Wenig Arbeitsspeicher ($((MEMK/1024)) MB) - lege voruebergehend 4 GB Auslagerung an"
+      { fallocate -l 4G $TMPSWAP 2>/dev/null || dd if=/dev/zero of=$TMPSWAP bs=1M count=4096 status=none; }         && chmod 600 $TMPSWAP && mkswap $TMPSWAP >/dev/null && swapon $TMPSWAP || { warn "Auslagerung nicht moeglich"; rm -f $TMPSWAP; TMPSWAP=""; }
     fi
-    cd /
+    J=$(nproc); MAXJ=$(( MEMK / 2000000 )); (( MAXJ < 1 )) && MAXJ=1; (( J > MAXJ )) && J=$MAXJ
+    info "Baue mit $J Kern(en) - Fortschritt: tail -f $LOG"
+    (
+      mkdir -p $SRC/build && cd $SRC/build || exit 1
+      cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_WERROR=OFF -DENABLE_SRSUE=OFF -DENABLE_SRSEPC=OFF         -DENABLE_GUI=OFF -DENABLE_HARDSIM=OFF -DENABLE_UHD=OFF -DENABLE_BLADERF=OFF -DENABLE_SKIQ=OFF         -DENABLE_ZEROMQ=OFF -DENABLE_SOAPYSDR=ON -DENABLE_RF_PLUGINS=ON >$LOG 2>&1 || exit 1
+      # erst parallel, bei Fehler (z. B. Speicher) einzeln weiterbauen
+      make -j"$J" >>$LOG 2>&1 || { echo "=== Wiederholung mit -j1 ===" >>$LOG; make -j1 >>$LOG 2>&1; } || exit 1
+      make install >>$LOG 2>&1 && ldconfig
+    ) || {
+      warn "srsRAN-Build fehlgeschlagen - letzte Fehler:"
+      grep -E "error|Error|Killed|fatal" $LOG | tail -15 | sed 's/^/     /'
+    }
+    [[ -n $TMPSWAP ]] && { swapoff $TMPSWAP; rm -f $TMPSWAP; }
+    grep -q "Found libSOAPYSDR" $LOG || warn "srsRAN ohne SoapySDR gebaut - LimeSDR fehlt (libsoapysdr-dev?)"
   fi
 fi
-command -v srsenb >/dev/null 2>&1 && info "srsenb: $(command -v srsenb)" || warn "srsenb fehlt - 4G nicht moeglich (Log: /tmp/srsran-build.log)."
+command -v srsenb >/dev/null 2>&1 && info "srsenb: $(command -v srsenb)" || warn "srsenb fehlt - 4G nicht moeglich (Log: /var/log/pkom-srsran-build.log)."
 
 # ---- Open5GS (4G-Kern mit SGs fuer CSFB) + MongoDB (Teilnehmer-DB) --------
 info "Python-Module fuer Open5GS-Steuerung"
@@ -227,7 +239,7 @@ fi
 # ---- Daemon entpacken ------------------------------------------------
 info "Steuer-Daemon + Weboberflaeche nach $PY"
 mkdir -p "$APPDIR"
-sed -n '/^__G90NET_PAYLOAD__$/,$p' "$0" | tail -n +2 | base64 -d > "$PY.new"
+sed -n '/^__G90NET_PAYLOAD__$/,$p' "$SELF" | tail -n +2 | base64 -d > "$PY.new"
 [[ -s "$PY.new" ]] || die "Payload-Entpacken fehlgeschlagen"
 python3 -c "import py_compile; py_compile.compile('$PY.new', doraise=True)" || die "Daemon fehlerhaft entpackt"
 mv -f "$PY.new" "$PY"; chmod 755 "$PY"
