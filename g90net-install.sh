@@ -101,6 +101,17 @@ for s in osmo-stp osmo-hlr osmo-mgw osmo-msc osmo-bsc osmo-bts-trx osmo-trx-lms 
   systemctl disable --now "${s}.service" 2>/dev/null || true
 done
 
+# Alte, in die G90-App eingebaute Mobilfunk-Dienste entfernen
+# (das Versuchsnetz ist jetzt nur noch dieses eigenstaendige Programm)
+for s in g90-cell g90-gsm; do
+  if [[ -f /etc/systemd/system/${s}.service ]]; then
+    info "Alten Dienst ${s} entfernen"
+    systemctl disable --now "${s}.service" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${s}.service"
+  fi
+done
+rm -f /opt/g90remote/g90cell.py /opt/g90remote/g90gsm.py
+
 # ---- NAT fuer Datenverkehr (EDGE/LTE) -------------------------------
 info "IP-Weiterleitung + NAT einrichten"
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
