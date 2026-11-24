@@ -3,8 +3,10 @@
 #  g90net - Installer fuer ein eigenes GSM(2G)- und LTE(4G)-Versuchsnetz
 #  mit Weboberflaeche. Fuer Debian 13 (Server) oder Raspberry Pi OS / Pi.
 #
-#  Installiert Osmocom (2G), srsRAN (4G), LimeSuite und den Steuer-Daemon
-#  g90net inkl. Weboberflaeche. Bedienung danach im Browser:
+#  Installiert Osmocom (2G), srsRAN + Open5GS + MongoDB (4G), LimeSuite und
+#  den Steuer-Daemon g90net inkl. Weboberflaeche. Mit zwei LimeSDR laeuft
+#  "LTE + GSM" (CSFB): Internet ueber 4G, Anrufe/SMS ueber GSM + SIP-Trunk.
+#  Bedienung danach im Browser:
 #      http://<IP-des-Rechners>:8080
 #
 #  Aufruf:
@@ -13,7 +15,7 @@
 #
 #  !!!  NUR an Dummy Load / Kabel + Daempfung / geschirmt. Offenes Netz ohne
 #       Authentisierung = IMSI-Catcher, wenn es abstrahlt. Nur eigene
-#       Test-SIMs. Testkennung 001/01 oder 999/99 - keine echten Betreiber.
+#       Test-SIMs. Kennung 001/xx (Test) oder 999/xx (privat) - keine echten Betreiber.
 # =====================================================================
 # Kein 'set -e': der Installer besteht aus vielen Best-Effort-Schritten (Pakete, Konfigs
 # nachziehen, NAT). Kritische Schritte sind unten explizit mit 'die' abgesichert.
@@ -74,9 +76,52 @@ if ! have_osmo; then
 fi
 have_osmo || warn "Nicht alle Osmocom-Binaries vorhanden - GSM meldet beim Start, was fehlt."
 
-info "srsRAN (4G) installieren"
+info "srsRAN (4G-Funk) installieren"
 apt-get install -y -qq srsran 2>/dev/null || apt-get install -y -qq srslte 2>/dev/null || true
-have_srs || warn "srsRAN (srsenb/srsepc) nicht gefunden - 4G erst nach Nachinstallation. Auf Debian 13: 'apt install srsran'."
+command -v srsenb >/dev/null 2>&1 || warn "srsenb nicht gefunden - 4G erst nach 'apt install srsran'."
+
+# ---- Open5GS (4G-Kern mit SGs fuer CSFB) + MongoDB (Teilnehmer-DB) --------
+info "Python-Module fuer Open5GS-Steuerung"
+apt-get install -y -qq python3-yaml python3-pymongo iproute2 2>/dev/null || warn "python3-yaml/python3-pymongo nicht installierbar"
+
+have_o5() { command -v open5gs-mmed >/dev/null 2>&1 && command -v open5gs-hssd >/dev/null 2>&1; }
+info "Open5GS (4G-Kern) installieren"
+apt-get install -y -qq open5gs 2>/dev/null || true
+if ! have_o5; then
+  warn "Open5GS nicht in den Standardquellen - binde Open5GS-Repo ein"
+  for FEED in "Debian_13" "Debian_12"; do
+    BASE="https://download.opensuse.org/repositories/home:/acetcom:/open5gs:/latest/${FEED}"
+    if curl -fsSL "$BASE/Release.key" -o /tmp/o5.key 2>/dev/null; then
+      gpg --dearmor < /tmp/o5.key > /usr/share/keyrings/open5gs.gpg 2>/dev/null || cp /tmp/o5.key /usr/share/keyrings/open5gs.gpg
+      echo "deb [signed-by=/usr/share/keyrings/open5gs.gpg] ${BASE}/ ./" > /etc/apt/sources.list.d/open5gs.list
+      apt-get update -qq 2>/dev/null && apt-get install -y -qq open5gs 2>/dev/null || true
+      have_o5 && { info "Open5GS aus $FEED"; break; }
+      rm -f /etc/apt/sources.list.d/open5gs.list
+    fi
+  done
+fi
+have_o5 || warn "Open5GS fehlt - LTE und 'LTE + GSM' melden beim Start, was fehlt."
+
+if ! command -v mongod >/dev/null 2>&1; then
+  if [[ $(uname -m) == x86_64 ]] && ! grep -qw avx /proc/cpuinfo; then
+    warn "CPU ohne AVX: aktuelle MongoDB laeuft hier nicht - LTE-Teilnehmer-DB nicht moeglich."
+  else
+    info "MongoDB (Teilnehmer-DB fuer Open5GS) installieren"
+    curl -fsSL https://pgp.mongodb.com/server-8.0.asc | gpg --dearmor > /usr/share/keyrings/mongodb-8.0.gpg 2>/dev/null || true
+    for CN in trixie bookworm; do
+      echo "deb [signed-by=/usr/share/keyrings/mongodb-8.0.gpg] https://repo.mongodb.org/apt/debian ${CN}/mongodb-org/8.0 main" \
+        > /etc/apt/sources.list.d/mongodb-org-8.0.list
+      apt-get update -qq 2>/dev/null && apt-get install -y -qq mongodb-org 2>/dev/null || true
+      command -v mongod >/dev/null 2>&1 && { info "MongoDB aus Zweig $CN"; break; }
+    done
+    command -v mongod >/dev/null 2>&1 || { rm -f /etc/apt/sources.list.d/mongodb-org-8.0.list; warn "MongoDB nicht installierbar"; }
+  fi
+fi
+command -v mongod >/dev/null 2>&1 && systemctl enable --now mongod >/dev/null 2>&1 || true
+
+# SCTP (S1AP + SGs) beim Booten laden
+modprobe sctp 2>/dev/null || warn "Kernelmodul sctp nicht ladbar"
+echo sctp > /etc/modules-load.d/pkom-sctp.conf
 
 # ---- Standardkonfigs bereitstellen ----------------------------------
 mkdir -p /etc/osmocom /etc/srsran /var/lib/g90net
@@ -99,6 +144,10 @@ done
 info "Automatische Osmocom-/srsRAN-Dienste abschalten"
 for s in osmo-stp osmo-hlr osmo-mgw osmo-msc osmo-bsc osmo-bts-trx osmo-trx-lms osmo-sip-connector osmo-pcu osmo-sgsn osmo-ggsn srsenb srsepc; do
   systemctl disable --now "${s}.service" 2>/dev/null || true
+done
+# Open5GS-Dienste ebenso (pKOM startet den Kern selbst mit eigener Konfig)
+for u in $(systemctl list-unit-files 'open5gs-*' --no-legend 2>/dev/null | awk '{print $1}'); do
+  systemctl disable --now "$u" 2>/dev/null || true
 done
 
 # Alte, in die G90-App eingebaute Mobilfunk-Dienste entfernen
@@ -140,7 +189,11 @@ WEB_PORT="$WEB_PORT"
 MCC="001"
 MNC="01"
 NETNAME="pKOM"
-DEV_ARGS="driver=lime"
+NETNAME_SHORT="pKOM"
+SPN="pKOM"
+NITZ="1"
+GSM_DEV=""
+LTE_DEV=""
 GSM_ARFCN="20"
 GSM_TX_GAIN="50"
 GSM_RX_GAIN="45"
@@ -159,6 +212,7 @@ LTE_NPRB="25"
 LTE_TX_GAIN="80"
 LTE_RX_GAIN="40"
 LTE_APN="internet"
+LTE_TAC="7"
 EOF
 fi
 
@@ -166,8 +220,9 @@ fi
 info "systemd-Dienst g90net anlegen"
 cat > "$UNIT" <<EOF
 [Unit]
-Description=g90net - GSM/LTE-Versuchsnetz mit Weboberflaeche
-After=network.target
+Description=g90net / pKOM - GSM/LTE-Versuchsnetz mit Weboberflaeche
+After=network.target mongod.service
+Wants=mongod.service
 
 [Service]
 User=root
@@ -198,11 +253,14 @@ cat <<EOF
   Log:              journalctl -u g90net -f
   Abschalten:       sudo bash $0 --off
 
-  Bedienung komplett im Browser: GSM (2G) oder LTE (4G) starten,
-  Frequenz/Kennung/Gain einstellen, SIMs verwalten.
+  Bedienung komplett im Browser:
+   - Steuerung: LimeSDR je Netz zuordnen, Kennung/Netzname/NITZ
+   - GSM, LTE oder "LTE + GSM" (CSFB, zwei LimeSDR) starten
+   - SIMs einmal eintragen (GSM-HLR + LTE-HSS automatisch)
+   - SIM-Profil: OPL/PNN/SPN-Werte fuer die eSIM
 
   WICHTIG: Nur an Dummy Load / Kabel + Daempfung / geschirmt betreiben.
-  Nur eigene Test-SIMs. Testkennung 001/01 oder 999/99.
+  Nur eigene Test-SIMs. Kennung 001/xx oder 999/xx.
   Hinweis Raspberry Pi 3: nur USB 2.0 - LimeSDR USB braucht USB 3.0 +
   Strom; fuer 4G ist der Pi 3 sehr knapp (kleine PRB-Bandbreite waehlen).
 =====================================================================

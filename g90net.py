@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # =====================================================================
 #  g90net - eigenes GSM(2G)- und LTE(4G)-Versuchsnetz mit Weboberflaeche
-#  Steuert Osmocom (2G) und srsRAN (4G) ueber einen LimeSDR. Ein Radio =
-#  immer nur EINE Technik gleichzeitig (Start der einen stoppt die andere).
+#  2G: Osmocom. 4G: srsENB (Funk) + Open5GS (Kern). Je Netz ein eigener
+#  LimeSDR (Auswahl im Webinterface). Modus "LTE + GSM" = CSFB: Handy bucht
+#  in 4G (Internet) ein, Anrufe fallen ueber SGs kurz auf GSM zurueck.
+#  SIMs werden nur einmal eingetragen (osmo-hlr + Open5GS-HSS automatisch).
 #
 #  !!!  NUR an Dummy Load / Kabel + Daempfung / geschirmt betreiben.
 #       Ein offenes Netz ohne Authentisierung = IMSI-Catcher, wenn es
@@ -13,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ------------------------------------------------------------------ Konfig
 CONF = os.environ.get("G90NET_CONF", "/etc/g90net.conf")
-WORKDIR = "/var/lib/g90net"
+WORKDIR = os.environ.get("G90NET_WORKDIR", "/var/lib/g90net")
 OSMO_CFG = "/etc/osmocom"
 SRS_CFG = "/etc/srsran"
 
@@ -21,7 +23,10 @@ DEFAULTS = {
     "WEB_PORT": "8080",
     # gemeinsam
     "TECH": "gsm",            # zuletzt gestartet
-    "MCC": "001", "MNC": "01", "NETNAME": "g90net",
+    "MCC": "001", "MNC": "01", "NETNAME": "pKOM", "NETNAME_SHORT": "pKOM", "SPN": "pKOM",
+    "NITZ": "1",              # Netzname + Uhrzeit/Zeitzone ans Handy senden (GSM: MM-Info, LTE: EMM-Info)
+    # LimeSDR je Netz (Seriennummer, leer = automatisch)
+    "GSM_DEV": "", "LTE_DEV": "",
     # 2G
     "GSM_ARFCN": "20", "GSM_TX_GAIN": "50", "GSM_RX_GAIN": "45",
     "GSM_OPEN": "1", "GSM_DATA": "0", "GSM_SIP": "0", "GSM_SIP_PEER": "", "GSM_SIP_LOCAL": "",
@@ -33,9 +38,7 @@ DEFAULTS = {
     "GSM_SMS_NUMBER": "Deine Rufnummer im {netz}-Netz ist jetzt {nummer}. Extern erreichbar: {extern}",
     # 4G
     "LTE_EARFCN": "1575", "LTE_NPRB": "25", "LTE_TX_GAIN": "80", "LTE_RX_GAIN": "40",
-    "LTE_APN": "internet",
-    # SDR
-    "DEV_ARGS": "driver=lime",
+    "LTE_APN": "internet", "LTE_TAC": "7",
 }
 
 def load_conf():
@@ -181,6 +184,87 @@ def _free_lime():
         except Exception as e:
             log("lime frei:", e)
 
+# ================================================================== LimeSDR-Auswahl
+# Je Netz ein eigener LimeSDR (z.B. LimeSDR Mini fuer GSM, LimeSDR USB fuer LTE).
+# Zuordnung ueber die Seriennummer (GSM_DEV / LTE_DEV), leer = automatisch.
+LIMES = []          # zuletzt gefundene Geraete [{serial, name, media, ...}]
+
+def lime_scan():
+    """Angeschlossene LimeSDR finden (LimeUtil, sonst SoapySDRUtil)."""
+    global LIMES
+    if FAKE:
+        LIMES = [{"serial": "1D3AC4F1A2B3C4", "name": "LimeSDR Mini", "media": "USB 3.0"},
+                 {"serial": "0009070105C6262E", "name": "LimeSDR-USB", "media": "USB 3.0"}]
+        return LIMES
+    devs = []
+    try:
+        out = subprocess.run(["LimeUtil", "--find"], capture_output=True, text=True, timeout=20).stdout
+        for m in re.finditer(r"\[([^\]]+)\]", out):
+            parts = [p.strip() for p in m.group(1).split(",")]
+            d = {"name": parts[0]}
+            for p in parts[1:]:
+                if "=" in p:
+                    k, v = p.split("=", 1); d[k.strip()] = v.strip()
+            if d.get("serial"): devs.append(d)
+    except Exception as e:
+        log("LimeUtil:", e)
+    if not devs:
+        try:
+            out = subprocess.run(["SoapySDRUtil", "--find=driver=lime"],
+                                 capture_output=True, text=True, timeout=30).stdout
+            for blk in re.split(r"Found device \d+", out)[1:]:
+                d = dict((k.strip(), v.strip()) for k, v in re.findall(r"(?m)^\s*(\w+)\s*=\s*(.+)$", blk))
+                if d.get("serial"):
+                    devs.append({"serial": d["serial"], "media": d.get("media", ""),
+                                 "name": (d.get("label") or d.get("name") or "LimeSDR").split("[")[0].strip()})
+        except Exception as e:
+            log("SoapySDRUtil:", e)
+    seen = set()
+    LIMES = [d for d in devs if not (d["serial"] in seen or seen.add(d["serial"]))]
+    log("LimeSDR gefunden:", ", ".join("%s %s" % (d["name"], d["serial"]) for d in LIMES) or "keine")
+    return LIMES
+
+def lime_assign(mode):
+    """(gsm_serial, lte_serial) fuer den Modus. Leere Wahl = erstes Geraet, das
+    nicht schon dem anderen Netz gehoert."""
+    devs = LIMES or lime_scan()
+    serials = [d["serial"] for d in devs]
+    g = C.get("GSM_DEV", "").strip(); l = C.get("LTE_DEV", "").strip()
+    first = lambda other: next((s for s in serials if s != other), "")
+    if mode in ("gsm", "csfb") and not g: g = first(l)
+    if mode in ("lte", "csfb") and not l: l = first(g)
+    if mode == "gsm": l = ""
+    if mode == "lte": g = ""
+    return g, l
+
+def lime_label(serial):
+    for d in LIMES:
+        if d["serial"] == serial:
+            return "%s (%s)" % (d.get("name", "LimeSDR"), serial)
+    return serial or "–"
+
+# ================================================================== Osmocom-Faehigkeiten
+_VTYREF = {}
+def osmo_has(binary, word):
+    """True/False, ob ein Osmocom-Programm einen VTY-Befehl kennt; None = unbekannt."""
+    if binary not in _VTYREF:
+        try:
+            _VTYREF[binary] = subprocess.run([binary, "--vty-ref-xml"], capture_output=True,
+                                             text=True, timeout=15).stdout
+        except Exception:
+            _VTYREF[binary] = ""
+    ref = _VTYREF[binary]
+    if "<vtydoc" not in ref: return None
+    return re.search(r'id=["\']%s\b' % re.escape(word), ref) is not None
+
+def tz_now():
+    """Zeitzone fuer NITZ: (Stunden, Minuten, Sommerzeit 0/1) ohne DST-Anteil."""
+    lt = time.localtime()
+    dst = 1 if lt.tm_isdst > 0 else 0
+    off = lt.tm_gmtoff // 60 - dst * 60
+    h = int(off / 60); m = abs(off) % 60
+    return h, min((0, 15, 30, 45), key=lambda x: abs(x - m)), dst
+
 # ================================================================== GSM (Osmocom)
 GSM_CORE = [
     ("stp", "osmo-stp", "osmo-stp.cfg"),
@@ -197,7 +281,7 @@ GSM_DATA = [
     ("pcu",  "osmo-pcu",  "osmo-pcu.cfg"),
 ]
 GSM_SIP = ("sip", "osmo-sip-connector", "osmo-sip-connector.cfg")
-GSM_NONFATAL = {"ggsn", "sgsn", "pcu", "sip"}
+GSM_NONFATAL = {"ggsn", "sgsn", "pcu", "sip", "nrf", "scp", "pkom"}
 OSMO_SERVICES = ["osmo-stp", "osmo-hlr", "osmo-mgw", "osmo-msc", "osmo-bsc",
                  "osmo-bts-trx", "osmo-trx-lms", "osmo-sip-connector",
                  "osmo-pcu", "osmo-sgsn", "osmo-ggsn"]
@@ -253,11 +337,33 @@ def gsm_prepare():
     _sub(os.path.join(WORKDIR, "osmo-msc.cfg"), [
         (r"^(\s*network country code\s+)\d+", r"\g<1>" + mcc),
         (r"^(\s*mobile network code\s+)\d+", r"\g<1>" + mnc),
-        (r"^(\s*short name\s+).*$", r"\g<1>" + C["NETNAME"]),
-        (r"^(\s*long name\s+).*$", r"\g<1>" + C["NETNAME"]),
     ])
     msc = os.path.join(WORKDIR, "osmo-msc.cfg"); hlr = os.path.join(WORKDIR, "osmo-hlr.cfg")
     _vty_del(msc, "authentication")
+    # Netzname + NITZ: MM-Information mit Name, Uhrzeit und Zeitzone ans Handy
+    word = lambda s: re.sub(r"[^\w.+-]", "-", s or "pKOM")      # VTY: ein Wort
+    _vty_set(msc, "network", "short name", "short name " + word(C.get("NETNAME_SHORT") or C["NETNAME"]))
+    _vty_set(msc, "network", "long name", "long name " + word(C["NETNAME"]))
+    if C.get("NITZ", "1") == "1":
+        _vty_set(msc, "network", "mm info", "mm info 1")
+        if osmo_has("osmo-msc", "timezone"):
+            _vty_set(msc, "network", "timezone", "timezone %d %d %d" % tz_now())
+    else:
+        _vty_set(msc, "network", "mm info", "mm info 0")
+        _vty_del(msc, "timezone")
+    # SGs zur Open5GS-MME (nur im Modus LTE + GSM)
+    t = open(msc).read()
+    t = re.sub(r"(?m)^sgs[ \t]*\n(?:[ \t]+.*(?:\n|$))*", "", t)
+    if NET.tech == "csfb":
+        t = t.rstrip("\n") + "\nsgs\n local-port %d\n local-ip 127.0.0.1\n vlr-name vlr.pkom.test\n" % SGS_PORT
+    open(msc, "w").write(t)
+    # eigener LimeSDR fuer GSM (osmo-trx-lms waehlt per Teilstring der Geraeteliste)
+    trx = os.path.join(WORKDIR, "osmo-trx-lms.cfg")
+    if os.path.isfile(trx):
+        if NET.dev_gsm:
+            _vty_set(trx, "trx", "dev-args", "dev-args serial=" + NET.dev_gsm)
+        else:
+            _vty_del(trx, "dev-args")
     if open_reg:
         _vty_set(hlr, "hlr", "subscriber-create-on-demand", "subscriber-create-on-demand no-msisdn cs+ps")
     else:
@@ -283,27 +389,118 @@ def gsm_prepare():
     if data_on and open_reg:
         _vty_set(os.path.join(WORKDIR, "osmo-sgsn.cfg"), "sgsn", "auth-policy", "auth-policy accept-all")
 
-# ---- GSM-SIMs ueber osmo-hlr VTY
-def gsm_sim_list():
-    if FAKE: return []
-    out = []
-    txt = vty(HLR_VTY, ["enable", "subscriber list"])
-    for m in re.finditer(r"IMSI[:\s]+(\d{14,15})", txt):
-        out.append(m.group(1))
-    return out
+# ---- SIMs: EINE Liste fuer beide Netze
+# Eingetragen wird nur hier; pKOM schreibt jede SIM automatisch ins osmo-hlr (GSM)
+# und in den Open5GS-HSS (LTE, MongoDB). Ki/OPc verlassen den Rechner nie
+# (die Weboberflaeche bekommt nur IMSI + Rufnummer zurueck).
+SIMS_FILE = os.path.join(WORKDIR, "sims.json")
 
-def gsm_sim_add(imsi, ki, opc, msisdn):
-    imsi = re.sub(r"\D", "", imsi); ki = re.sub(r"[^0-9a-fA-F]", "", ki); opc = re.sub(r"[^0-9a-fA-F]", "", opc)
-    if len(imsi) < 14 or len(ki) != 32 or len(opc) != 32:
-        return "IMSI (15), Ki und OPc (je 32 Hex) pruefen"
-    msisdn = re.sub(r"\D", "", msisdn) or imsi[-8:]
+def sims_load():
+    try: return json.load(open(SIMS_FILE))
+    except Exception: return {}
+
+def sims_save(d):
+    try:
+        tmp = SIMS_FILE + ".tmp"
+        with open(tmp, "w") as f: json.dump(d, f, indent=1)
+        os.chmod(tmp, 0o600); os.replace(tmp, SIMS_FILE)
+    except Exception as e:
+        log("sims:", e)
+
+def gsm_on():
+    return NET.tech in ("gsm", "csfb")
+
+def lte_on():
+    return NET.tech in ("lte", "csfb")
+
+def _hex32(x):
+    return re.sub(r"[^0-9a-fA-F]", "", x or "").upper()
+
+def hlr_put(imsi, s):
     if FAKE: return None
     r = vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} create",
-                      f"subscriber imsi {imsi} update msisdn {msisdn}",
-                      f"subscriber imsi {imsi} update aud3g milenage k {ki} opc {opc}"])
-    ok = "% " not in r
-    if ok: sms_send(imsi, _sms_text(C.get("GSM_SMS_NUMBER", ""), nummer=msisdn))
-    return None if ok else r
+                      f"subscriber imsi {imsi} update msisdn {s.get('msisdn') or imsi[-8:]}",
+                      f"subscriber imsi {imsi} update aud3g milenage k {s['ki']} opc {s['opc']}"])
+    return None if "% " not in r.replace("% Subscriber already exists", "") else r.strip()[-160:]
+
+def _hss():
+    import pymongo
+    return pymongo.MongoClient("mongodb://127.0.0.1/", serverSelectionTimeoutMS=3000)["open5gs"]["subscribers"]
+
+def hss_put(imsi, s):
+    """SIM in den Open5GS-HSS schreiben (anlegen oder aktualisieren, SQN bleibt)."""
+    if FAKE: return None
+    try:
+        from bson.int64 import Int64
+        ambr = {"downlink": {"value": 1, "unit": 3}, "uplink": {"value": 1, "unit": 3}}   # 1 Gbit/s
+        sess = {"name": C.get("LTE_APN") or "internet", "type": 3,          # 3 = IPv4v6
+                "qos": {"index": 9, "arp": {"priority_level": 8, "pre_emption_capability": 1,
+                                            "pre_emption_vulnerability": 1}},
+                "ambr": ambr, "pcc_rule": []}
+        _hss().update_one({"imsi": imsi}, {
+            "$set": {"imsi": imsi, "msisdn": [s["msisdn"]] if s.get("msisdn") else [],
+                     "security.k": s["ki"], "security.opc": s["opc"], "security.op": None,
+                     "security.amf": "8000", "ambr": ambr,
+                     "slice": [{"sst": 1, "default_indicator": True, "session": [sess]}],
+                     "access_restriction_data": 32, "subscriber_status": 0,
+                     "operator_determined_barring": 0,
+                     "network_access_mode": 0,        # 0 = Paket + Leitung -> kombinierter Attach (CSFB)
+                     "subscribed_rau_tau_timer": 12},
+            "$setOnInsert": {"security.sqn": Int64(97), "imeisv": [], "mme_host": [],
+                             "mme_realm": [], "purge_flag": [], "__v": 0}}, upsert=True)
+        return None
+    except ImportError:
+        return "python3-pymongo fehlt (Installer erneut ausfuehren)"
+    except Exception as e:
+        return "HSS/MongoDB: %s" % str(e)[:120]
+
+def hss_del(imsi):
+    if FAKE: return
+    try: _hss().delete_one({"imsi": imsi})
+    except Exception as e: log("hss loeschen:", e)
+
+def hss_sync_all():
+    errs = [e for e in (hss_put(i, s) for i, s in sims_load().items()) if e]
+    return errs[0] if errs else None
+
+def sim_add(imsi, ki, opc, msisdn):
+    imsi = re.sub(r"\D", "", imsi or ""); ki = _hex32(ki); opc = _hex32(opc)
+    if len(imsi) < 14 or len(ki) != 32 or len(opc) != 32:
+        return "IMSI (15 Ziffern), Ki und OPc (je 32 Hex) pruefen"
+    msisdn = re.sub(r"\D", "", msisdn or "") or nums_load().get(imsi) or imsi[-8:]
+    d = sims_load(); d[imsi] = {"ki": ki, "opc": opc, "msisdn": msisdn}; sims_save(d)
+    n = nums_load(); n[imsi] = msisdn; nums_save(n)          # Rufnummer dauerhaft
+    errs = []
+    e = hss_put(imsi, d[imsi])
+    if e: errs.append(e)
+    if gsm_on() and not FAKE:
+        e = hlr_put(imsi, d[imsi])
+        if e: errs.append("HLR: " + e)
+        else: sms_send(imsi, _sms_text(C.get("GSM_SMS_NUMBER", ""), nummer=msisdn))
+    return ("SIM gespeichert, aber: " + "; ".join(errs)) if errs else None
+
+def sim_del(imsi):
+    imsi = re.sub(r"\D", "", imsi or "")
+    d = sims_load()
+    if imsi in d:
+        del d[imsi]; sims_save(d)
+    hss_del(imsi)
+    if gsm_on() and not FAKE:
+        vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} delete"])
+
+def _migrate_lte_db():
+    """Alte srsEPC-Liste (user_db.csv) einmalig in die gemeinsame SIM-Liste uebernehmen."""
+    udb = os.path.join(WORKDIR, "user_db.csv")
+    if not os.path.isfile(udb): return
+    d = sims_load(); nums = nums_load(); n = 0
+    for l in open(udb).read().splitlines():
+        f = l.split(",")
+        if len(f) >= 5 and not l.startswith("#") and f[0] not in d and len(_hex32(f[3])) == 32:
+            d[f[0]] = {"ki": _hex32(f[3]), "opc": _hex32(f[4]), "msisdn": nums.get(f[0], "")}; n += 1
+    if n: sims_save(d)
+    try: os.replace(udb, udb + ".alt")
+    except Exception: pass
+    log(f"{n} SIM(s) aus der alten srsEPC-Liste uebernommen")
 
 # Dauerhafte IMSI->Rufnummer-Zuweisungen (ueberleben Neustarts, werden bei jedem
 # GSM-Start erneut ins HLR geschrieben - auch fuer offen angemeldete SIMs ohne Ki).
@@ -318,8 +515,13 @@ def nums_save(d):
     except Exception as e: log("numbers:", e)
 
 def gsm_apply_numbers():
+    """Beim GSM-Start: alle SIMs (mit Schluessel) + Rufnummern ins HLR schreiben."""
+    if FAKE: return
+    for imsi, s in sims_load().items():
+        e = hlr_put(imsi, s)
+        if e: log("hlr:", imsi, e)
     d = nums_load()
-    if not d or FAKE: return
+    if not d: return
     cmds = ["enable"]
     for imsi, msisdn in d.items():
         cmds += [f"subscriber imsi {imsi} create", f"subscriber imsi {imsi} update msisdn {msisdn}"]
@@ -329,7 +531,10 @@ def gsm_sim_nr(imsi, msisdn):
     imsi = re.sub(r"\D", "", imsi); msisdn = re.sub(r"\D", "", msisdn)
     if len(imsi) < 14 or not msisdn: return "IMSI (15 Ziffern) und Rufnummer pruefen"
     d = nums_load(); d[imsi] = msisdn; nums_save(d)        # dauerhaft merken
-    if not FAKE and NET.tech == "gsm":                      # sofort anwenden, wenn GSM laeuft
+    s = sims_load()
+    if imsi in s:                                           # SIM mit Schluessel: auch im HSS
+        s[imsi]["msisdn"] = msisdn; sims_save(s); hss_put(imsi, s[imsi])
+    if not FAKE and gsm_on():                               # sofort anwenden, wenn GSM laeuft
         vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} create",
                       f"subscriber imsi {imsi} update msisdn {msisdn}"])
         sms_send(imsi, _sms_text(C.get("GSM_SMS_NUMBER", ""), nummer=msisdn))
@@ -339,13 +544,49 @@ def gsm_num_del(imsi):
     imsi = re.sub(r"\D", "", imsi); d = nums_load()
     if imsi in d:
         del d[imsi]; nums_save(d)
-    if not FAKE and NET.tech == "gsm":
+    if not FAKE and gsm_on():
         vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} update msisdn "])
 
-def gsm_sim_del(imsi):
-    imsi = re.sub(r"\D", "", imsi)
-    if FAKE: return
-    vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} delete"])
+# ---- SIM-Dateien fuer das eSIM-Profil (OPL / PNN / SPN)
+# Diese drei Dateien liegen auf der SIM, nicht im Netz. pKOM berechnet die Werte
+# passend zu Kennung + Netzname; sie werden im eSIM-Profil eingetragen.
+GSM7 = ("@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ\x1bÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
+        "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà")
+
+def gsm7_codes(s):
+    return [GSM7.index(ch) if ch in GSM7 and ch not in "\n\r\x1b" else 0x3F for ch in (s or "")]
+
+def gsm7_pack(codes):
+    bits = n = 0; out = bytearray()
+    for c in codes:
+        bits |= (c & 0x7F) << n; n += 7
+        while n >= 8:
+            out.append(bits & 0xFF); bits >>= 8; n -= 8
+    if n: out.append(bits & 0xFF)
+    return bytes(out), (8 - (len(codes) * 7) % 8) % 8
+
+def _nn_ie(tag, name):
+    """Netzname-IE (TS 24.008 10.5.3.5a): GSM-7, ohne Laenderkuerzel."""
+    packed, spare = gsm7_pack(gsm7_codes(name))
+    body = bytes([0x80 | spare]) + packed
+    return bytes([tag, len(body)]) + body
+
+def plmn_bcd(mcc, mnc):
+    m3 = mnc[2] if len(mnc) == 3 else "F"
+    return bytes([int(mcc[1] + mcc[0], 16), int(m3 + mcc[2], 16), int(mnc[1] + mnc[0], 16)])
+
+def sim_files():
+    mcc, mnc = C.get("MCC", ""), C.get("MNC", "")
+    full = C.get("NETNAME") or "pKOM"; short = C.get("NETNAME_SHORT") or full
+    spn = (C.get("SPN") or full)[:16]
+    try: plmn = plmn_bcd(mcc, mnc)
+    except Exception: plmn = b"\xff\xff\xff"
+    spn_b = bytes([0x00]) + bytes(gsm7_codes(spn)) + b"\xff" * (16 - len(spn))
+    pnn = _nn_ie(0x43, full) + _nn_ie(0x45, short)
+    opl = plmn + b"\x00\x00\xff\xfe\x01"          # LAC/TAC 0000-FFFE -> PNN-Eintrag 1
+    hx = lambda b: b.hex().upper()
+    return {"spn": hx(spn_b), "pnn": hx(pnn), "opl": hx(opl), "plmn": hx(plmn),
+            "hplmn": mcc + mnc, "spn_text": spn, "full": full, "short": short}
 
 # ---- SMS ueber osmo-msc VTY
 # Die MSC puffert MT-SMS in ihrer DB und stellt sie beim Einbuchen zu - der
@@ -366,7 +607,7 @@ def _sms_text(tmpl, nummer=""):
 
 def sms_send(imsi, text, force=False):
     imsi = re.sub(r"\D", "", imsi or "")
-    if FAKE or NET.tech != "gsm" or not imsi or not text:
+    if FAKE or not gsm_on() or not imsi or not text:
         return
     if C.get("GSM_SMS", "1") != "1" and not force:   # Auto-SMS aus (Test ignoriert das)
         return
@@ -380,14 +621,14 @@ def sms_test(imsi, text=""):
     imsi = re.sub(r"\D", "", imsi or "")
     if len(imsi) < 14:  return "IMSI angeben (14-15 Ziffern)"
     if FAKE:            return "Testmodus (FAKE): nichts gesendet"
-    if NET.tech != "gsm": return "GSM-Netz laeuft nicht"
+    if not gsm_on(): return "GSM-Netz laeuft nicht (GSM oder LTE + GSM starten)"
     txt = _sms_text(text) if (text or "").strip() else _sms_text(C.get("GSM_SMS_WELCOME", ""))
     sms_send(imsi, txt, force=True)
     return f"Test-SMS an {imsi} gesendet"
 
 def msc_attached():
     """IMSIs, die aktuell in der MSC (VLR) eingebucht sind."""
-    if FAKE or NET.tech != "gsm":
+    if FAKE or not gsm_on():
         return set()
     txt = vty(MSC_VTY, ["enable", "show subscriber cache"])
     return set(re.findall(r"IMSI\D{0,3}(\d{14,15})", txt))
@@ -396,7 +637,7 @@ def sms_welcome_watch():
     """Hintergrund: neue Einbuchungen erkennen und einmalig begruessen."""
     while True:
         try:
-            if NET.tech == "gsm" and NET.state == "laeuft" and C.get("GSM_SMS", "1") == "1":
+            if gsm_on() and NET.state == "laeuft" and C.get("GSM_SMS", "1") == "1":
                 for imsi in msc_attached() - NET.welcomed:
                     NET.welcomed.add(imsi)      # vor dem Senden merken: kein Spam bei Fehler
                     log("willkommens-sms ->", imsi)
@@ -405,86 +646,248 @@ def sms_welcome_watch():
             log("sms-watch:", e)
         time.sleep(6)
 
-# ================================================================== LTE (srsRAN)
-def lte_prepare():
-    os.makedirs(WORKDIR, exist_ok=True)
-    mcc, mnc = C["MCC"], C["MNC"]; earfcn = int(C["LTE_EARFCN"]); nprb = int(C["LTE_NPRB"])
-    band = earfcn_band(earfcn)
-    # srsRAN-Beispielkonfigs kopieren und patchen
-    for cfg in ("enb.conf", "rr.conf", "sib.conf", "rb.conf", "epc.conf"):
-        src = os.path.join(SRS_CFG, cfg)
-        if os.path.isfile(src): shutil.copy(src, os.path.join(WORKDIR, cfg))
-    enb = os.path.join(WORKDIR, "enb.conf")
-    _sub(enb, [
-        (r"^(\s*mcc\s*=\s*)\S+", r"\g<1>" + mcc),
-        (r"^(\s*mnc\s*=\s*)\S+", r"\g<1>" + mnc),
-        (r"^(\s*dl_earfcn\s*=\s*)\S+", r"\g<1>" + str(earfcn)),
-        (r"^(\s*n_prb\s*=\s*)\S+", r"\g<1>" + str(nprb)),
-        (r"^(\s*device_name\s*=\s*)\S+", r"\g<1>soapy"),
-        (r"^(\s*device_args\s*=\s*).*$", r"\g<1>" + C["DEV_ARGS"]),
-        (r"^(\s*tx_gain\s*=\s*)\S+", r"\g<1>" + C["LTE_TX_GAIN"]),
-        (r"^(\s*rx_gain\s*=\s*)\S+", r"\g<1>" + C["LTE_RX_GAIN"]),
-    ])
-    epc = os.path.join(WORKDIR, "epc.conf")
-    _sub(epc, [
-        (r"^(\s*mcc\s*=\s*)\S+", r"\g<1>" + mcc),
-        (r"^(\s*mnc\s*=\s*)\S+", r"\g<1>" + mnc),
-        (r"^(\s*apn\s*=\s*)\S+", r"\g<1>" + C["LTE_APN"]),
-    ])
-    # user_db
-    udb = os.path.join(WORKDIR, "user_db.csv")
-    if not os.path.isfile(udb):
-        open(udb, "w").write("# imsi,auth,ki,opc,amf,sqn,qci,ip\n")
+# ================================================================== LTE: srsENB (Funk) + Open5GS (Kern)
+# Open5GS statt srsEPC, weil nur dessen MME die SGs-Schnittstelle zur osmo-msc
+# hat (CSFB). Die Open5GS-Dienste laufen nicht ueber systemd, sondern werden von
+# pKOM mit eigenen Konfigs gestartet (Vorlage: /etc/open5gs/*.yaml).
+O5_ETC = "/etc/open5gs"
+O5_DIR = os.path.join(WORKDIR, "open5gs")
+O5_NFS = [("nrf", "open5gs-nrfd"), ("scp", "open5gs-scpd"), ("hss", "open5gs-hssd"),
+          ("pcrf", "open5gs-pcrfd"), ("sgwc", "open5gs-sgwcd"), ("sgwu", "open5gs-sgwud"),
+          ("smf", "open5gs-smfd"), ("upf", "open5gs-upfd"), ("mme", "open5gs-mmed")]
+O5_OPTIONAL = {"nrf", "scp"}
+UE_NET, UE_GW = "10.45.0.0/16", "10.45.0.1/16"       # Open5GS-Standard (smf/upf.yaml)
+NPRB_MHZ = {6: 1.4, 15: 3, 25: 5, 50: 10, 75: 15, 100: 20}
+SGS_PORT = 29118
 
-def lte_sim_add(imsi, ki, opc, msisdn):
-    imsi = re.sub(r"\D", "", imsi); ki = re.sub(r"[^0-9a-fA-F]", "", ki); opc = re.sub(r"[^0-9a-fA-F]", "", opc)
-    if len(imsi) < 14 or len(ki) != 32 or len(opc) != 32:
-        return "IMSI (15), Ki und OPc (je 32 Hex) pruefen"
-    udb = os.path.join(WORKDIR, "user_db.csv")
-    lines = []
-    if os.path.isfile(udb):
-        lines = [l for l in open(udb).read().splitlines() if not l.startswith(imsi + ",")]
-    else:
-        lines = ["# imsi,auth,ki,opc,amf,sqn,qci,ip"]
-    # name,auth,key,op_type,op,amf,sqn,qci  (srsEPC Format: name,auth,imsi,key,opc,amf,sqn,qci,ip)
-    lines.append("%s,mil,%s,%s,%s,9001,000000001234,7,dynamic" % (imsi, imsi, ki, opc))
-    open(udb, "w").write("\n".join(lines) + "\n")
-    return None
+def _plmn_walk(o, mcc, mnc):
+    """Jede PLMN-Angabe (mcc/mnc) in einer Open5GS-Konfig auf die eigene Kennung setzen."""
+    if isinstance(o, dict):
+        if "mcc" in o and "mnc" in o:
+            o["mcc"] = mcc; o["mnc"] = mnc      # als Text: fuehrende Nullen + MNC-Laenge bleiben
+        for v in o.values(): _plmn_walk(v, mcc, mnc)
+    elif isinstance(o, list):
+        for v in o: _plmn_walk(v, mcc, mnc)
 
-def lte_sim_list():
-    udb = os.path.join(WORKDIR, "user_db.csv")
-    out = []
-    if os.path.isfile(udb):
-        for l in open(udb).read().splitlines():
-            if l and not l.startswith("#"):
-                out.append(l.split(",")[0])
+def gsm_lac():
+    try:
+        t = open(os.path.join(WORKDIR, "osmo-bsc.cfg")).read()
+        m = re.search(r"(?m)^\s*location_area_code\s+(?:lac\s+)?(0x[0-9a-fA-F]+|\d+)", t)
+        if m: return int(m.group(1), 0)
+    except Exception: pass
+    return 1
+
+def o5_prepare(csfb, etc=O5_ETC, outdir=O5_DIR):
+    """Open5GS-Konfigs erzeugen. Rueckgabe: {nf: (binary, yaml-pfad)} in Startreihenfolge."""
+    import yaml
+    os.makedirs(outdir, exist_ok=True)
+    mcc, mnc = C["MCC"], C["MNC"]; tac = int(C.get("LTE_TAC") or 7)
+    plmn = {"mcc": mcc, "mnc": mnc}
+    out = {}
+    for nf, binary in O5_NFS:
+        src = os.path.join(etc, nf + ".yaml")
+        if not os.path.isfile(src):
+            if nf in O5_OPTIONAL: continue
+            raise RuntimeError(f"{src} fehlt - ist Open5GS installiert?")
+        o = yaml.safe_load(open(src)) or {}
+        o.pop("logger", None)                       # Log nach stdout -> Protokoll-Tab
+        _plmn_walk(o, mcc, mnc)
+        if nf == "mme":
+            m = o.setdefault("mme", {})
+            if C.get("NITZ", "1") == "1":           # EMM-Information: Netzname + Zeit/Zeitzone
+                m["network_name"] = {"full": C["NETNAME"], "short": C.get("NETNAME_SHORT") or C["NETNAME"]}
+            else:
+                m.pop("network_name", None)
+            tai = m.get("tai")
+            tais = tai if isinstance(tai, list) else ([tai] if isinstance(tai, dict) else [])
+            for t in tais: t["tac"] = tac
+            if not tais: m["tai"] = [{"plmn_id": dict(plmn), "tac": tac}]
+            new_fmt = isinstance(m.get("s1ap"), dict)   # Open5GS >= 2.7
+            o.pop("sgsap", None); m.pop("sgsap", None)
+            if csfb:
+                mp = {"tai": {"plmn_id": dict(plmn), "tac": tac},
+                      "lai": {"plmn_id": dict(plmn), "lac": gsm_lac()}}
+                if new_fmt:
+                    m["sgsap"] = {"client": [{"address": "127.0.0.1", "local_address": "127.0.0.2",
+                                              "port": SGS_PORT, "map": mp}]}
+                else:
+                    o["sgsap"] = [{"addr": "127.0.0.1", "port": SGS_PORT, "map": mp}]
+        dst = os.path.join(outdir, nf + ".yaml")
+        with open(dst, "w") as f:
+            yaml.safe_dump(o, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        out[nf] = (binary, dst)
     return out
 
-def lte_sim_del(imsi):
-    imsi = re.sub(r"\D", "", imsi)
-    udb = os.path.join(WORKDIR, "user_db.csv")
-    if os.path.isfile(udb):
-        lines = [l for l in open(udb).read().splitlines() if not l.startswith(imsi + ",")]
-        open(udb, "w").write("\n".join(lines) + "\n")
+def _srs_template(name):
+    for p in (os.path.join(SRS_CFG, name), f"/usr/share/srsran/{name}.example",
+              f"/usr/share/srsran/{name}", f"/usr/share/doc/srsran/examples/{name}.example"):
+        if os.path.isfile(p): return p
+    return None
+
+def _drop_block(t, name):
+    """libconfig-Block 'name = { ... };' entfernen (Klammern gezaehlt)."""
+    m = re.search(rf"(?m)^{name}\s*=\s*\{{", t)
+    if not m: return t
+    i = t.index("{", m.start()); depth = 0
+    for j in range(i, len(t)):
+        if t[j] == "{": depth += 1
+        elif t[j] == "}":
+            depth -= 1
+            if depth == 0:
+                k = j + 1
+                while k < len(t) and t[k] in " \t;": k += 1
+                return t[:m.start()] + t[k:]
+    return t
+
+def _si_mapping(t, add7):
+    def f(m):
+        nums = [x.strip() for x in m.group(2).split(",") if x.strip() and x.strip() != "7"]
+        if add7: nums.append("7")
+        return m.group(1) + ", ".join(nums) + m.group(3)
+    return re.sub(r"(si_mapping_info\s*=\s*\[\s*)([^\]]*?)(\s*\])", f, t, count=1)
+
+def sib_patch(t, csfb, arfcn):
+    """SIB7 (GERAN-Nachbar) nur im CSFB-Modus: srsENB schickt das Handy bei
+    einem Anruf per RRC-Release mit Umleitung auf genau diese GSM-Frequenz."""
+    t = _drop_block(t, "sib7")
+    t = _si_mapping(t, csfb)
+    if csfb:
+        t = t.rstrip() + f"""
+
+// pKOM: GSM-Zelle fuer CS-Fallback (Anrufe)
+sib7 =
+{{
+    t_resel_geran = 1;
+    carrier_freqs_info_list =
+    (
+        {{
+            cell_resel_prio = 0;
+            ncc_permitted = 255;
+            q_rx_lev_min = 0;
+            thresh_x_high = 2;
+            thresh_x_low = 2;
+            start_arfcn = {arfcn};
+            band_ind = "dcs1800";
+            explicit_list_of_arfcns = ( {arfcn} );
+        }}
+    );
+}};
+"""
+    return t
+
+def enb_prepare(csfb, serial):
+    for f in ("rr.conf", "sib.conf", "rb.conf"):
+        p = _srs_template(f)
+        if not p: raise RuntimeError(f"srsRAN-Vorlage {f} fehlt - ist srsran installiert?")
+        shutil.copy(p, os.path.join(WORKDIR, f))
+    earfcn = int(C["LTE_EARFCN"]); tac = int(C.get("LTE_TAC") or 7)
+    rr = os.path.join(WORKDIR, "rr.conf"); t = open(rr).read()
+    t = re.sub(r"(?m)^(\s*tac\s*=\s*)[^;]+;", r"\g<1>0x%04X;" % tac, t, count=1)
+    t = re.sub(r"(?m)^(\s*dl_earfcn\s*=\s*)\d+;", r"\g<1>%d;" % earfcn, t, count=1)  # 1. = eigene Zelle
+    open(rr, "w").write(t)
+    sib = os.path.join(WORKDIR, "sib.conf")
+    open(sib, "w").write(sib_patch(open(sib).read(), csfb, int(C["GSM_ARFCN"])))
+    dev = "driver=lime" + (",serial=" + serial if serial else "")
+    open(os.path.join(WORKDIR, "enb.conf"), "w").write(f"""# pKOM - automatisch erzeugt
+[enb]
+enb_id = 0x19B
+mcc = {C['MCC']}
+mnc = {C['MNC']}
+mme_addr = 127.0.0.2
+gtp_bind_addr = 127.0.1.1
+s1c_bind_addr = 127.0.1.1
+s1c_bind_port = 0
+n_prb = {int(C['LTE_NPRB'])}
+
+[enb_files]
+sib_config = {sib}
+rr_config = {rr}
+rb_config = {os.path.join(WORKDIR, 'rb.conf')}
+
+[rf]
+tx_gain = {C['LTE_TX_GAIN']}
+rx_gain = {C['LTE_RX_GAIN']}
+device_name = soapy
+device_args = {dev}
+
+[log]
+all_level = warning
+filename = stdout
+""")
+
+def _run(*cmd):
+    return subprocess.run(list(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+
+def ue_net_up():
+    """Tunnel fuer die Handy-Datenverbindungen + NAT ins Internet."""
+    _run("modprobe", "sctp")
+    _run("ip", "tuntap", "add", "name", "ogstun", "mode", "tun")
+    _run("ip", "addr", "replace", UE_GW, "dev", "ogstun")
+    _run("ip", "link", "set", "ogstun", "up")
+    _run("sysctl", "-w", "net.ipv4.ip_forward=1")
+    for chk, add in ((["-t", "nat", "-C", "POSTROUTING", "-s", UE_NET, "!", "-o", "ogstun", "-j", "MASQUERADE"],
+                      ["-t", "nat", "-A", "POSTROUTING", "-s", UE_NET, "!", "-o", "ogstun", "-j", "MASQUERADE"]),
+                     (["-C", "FORWARD", "-i", "ogstun", "-j", "ACCEPT"], ["-I", "FORWARD", "-i", "ogstun", "-j", "ACCEPT"]),
+                     (["-C", "FORWARD", "-o", "ogstun", "-j", "ACCEPT"], ["-I", "FORWARD", "-o", "ogstun", "-j", "ACCEPT"])):
+        if _run("iptables", *chk) != 0: _run("iptables", *add)
+
+def freq_clash():
+    """GSM-Traeger darf nicht im LTE-Kanal liegen (gleiches Band 1800 MHz)."""
+    try:
+        g = arfcn_mhz(int(C["GSM_ARFCN"])); l = earfcn_mhz(int(C["LTE_EARFCN"]))
+        bw = NPRB_MHZ.get(int(C["LTE_NPRB"]), 5)
+        if g and l and abs(g - l) < bw / 2 + 0.3:
+            return f"GSM {g} MHz liegt im LTE-Kanal {l} MHz ±{bw/2:g} - andere ARFCN/EARFCN waehlen"
+    except Exception: pass
+    return None
+
+def preflight(mode):
+    mcc, mnc = C.get("MCC", "").strip(), C.get("MNC", "").strip()
+    if not re.fullmatch(r"\d{3}", mcc) or not re.fullmatch(r"\d{2,3}", mnc):
+        return "Netzkennung pruefen: MCC 3 Ziffern, MNC 2-3 Ziffern"
+    if mcc not in ("001", "999"):
+        return "Nur Test-/Privatkennungen: MCC 001 (Test) oder 999 (privat)"
+    g, l = lime_assign(mode)
+    if mode == "csfb":
+        if not FAKE and (not g or not l or g == l):
+            return "LTE + GSM braucht zwei verschiedene LimeSDR - im Tab Steuerung zuordnen"
+        e = freq_clash()
+        if e: return e
+    if not FAKE:
+        need = []
+        if mode in ("gsm", "csfb"): need += [b for _n, b, _c in GSM_CORE]
+        if mode in ("lte", "csfb"):
+            need += ["srsenb"] + [b for nf, b in O5_NFS if nf not in O5_OPTIONAL]
+            try: import yaml  # noqa
+            except ImportError: return "python3-yaml fehlt (Installer erneut ausfuehren)"
+        miss = [b for b in need if not shutil.which(b)]
+        if miss: return "Fehlt: " + ", ".join(miss) + " (Installer erneut ausfuehren)"
+        if mode == "csfb" and osmo_has("osmo-msc", "sgs") is False:
+            return "Diese osmo-msc kann kein SGs (CSFB) - neuere Osmocom-Version noetig"
+    NET.dev_gsm, NET.dev_lte = g, l
+    return None
 
 # ================================================================== Netz-Manager
+MODES = {"gsm": "GSM (2G)", "lte": "LTE (4G)", "csfb": "LTE + GSM (CSFB)"}
+
 class Net:
     def __init__(self):
         self.lock = threading.RLock()
-        self.tech = None          # None | "gsm" | "lte"
+        self.tech = None          # None | "gsm" | "lte" | "csfb"
         self.state = "aus"        # aus | startet | laeuft | fehler
         self.msg = ""
         self.procs = {}
         self.loglines = []
         self.started = 0.0
         self.welcomed = set()     # IMSIs, die in dieser Netz-Session schon begruesst wurden
+        self.dev_gsm = self.dev_lte = ""
 
     def _log(self, tag, line):
         line = line.rstrip()
         if not line: return
         print(f"{tag}: {line}", flush=True)   # -> journald, damit 'journalctl -u g90net' alles zeigt
         self.loglines.append(f"{tag}: {line}")
-        if len(self.loglines) > 400: self.loglines = self.loglines[-400:]
+        if len(self.loglines) > 600: self.loglines = self.loglines[-600:]
         low = line.lower()
         if ("fatal" in low or "failed to create radio" in low) and tag not in GSM_NONFATAL:
             self.msg = f"{tag}: {line[:120]}"
@@ -495,6 +898,9 @@ class Net:
                 self._log(tag, raw)
         except Exception:
             pass
+        rc = p.poll()
+        if self.procs.get(tag) is p and self.state == "laeuft" and tag not in GSM_NONFATAL:
+            self.msg = f"{tag} beendet (Code {rc}) - siehe Protokoll"
 
     def _spawn(self, binary, args, tag):
         p = subprocess.Popen([binary] + args, stdout=subprocess.PIPE,
@@ -506,88 +912,101 @@ class Net:
     def stop(self):
         with self.lock:
             if FAKE:
-                self.tech=None; self.state="aus"; self.procs={}; return
-            for tag, p in list(self.procs.items()):
+                self.tech = None; self.state = "aus"; self.procs = {}; return
+            procs, self.procs = self.procs, {}
+            for tag, p in list(procs.items()):
                 try: p.terminate()
                 except Exception: pass
             time.sleep(1)
-            for name in OSMO_SERVICES + ["srsenb", "srsepc"]:
+            for name in OSMO_SERVICES + ["srsenb", "srsepc", "open5gs-"]:
                 try: subprocess.run(["pkill", "-9", "-f", name],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except Exception: pass
-            self.procs = {}
             if self.tech:
                 _lime_service("start")   # G90-Empfang wieder frei geben
             self.tech = None; self.state = "aus"; self.msg = "gestoppt"
 
-    def start_gsm(self):
+    def start(self, mode):
+        if mode not in MODES: return "unbekannter Modus"
         with self.lock:
-            self.stop(); self.tech = "gsm"; self.state = "startet"; self.msg=""
+            self.stop(); self.tech = mode; self.state = "startet"; self.msg = ""
             self.loglines = []; self.started = time.time(); self.welcomed = set()
+        err = preflight(mode)
+        if err:
+            with self.lock: self.tech = None; self.state = "fehler"; self.msg = err
+            return err
         if FAKE:
-            with self.lock: self.state = "laeuft"; self.msg = "GSM laeuft (FAKE)"
+            with self.lock: self.state = "laeuft"; self.msg = MODES[mode] + " laeuft (FAKE)"
             return None
+        gsm, lte = mode in ("gsm", "csfb"), mode in ("lte", "csfb")
         try:
-            self._prep_osmo_services_off()
-            gsm_prepare()
+            if gsm:
+                self._services_off(OSMO_SERVICES)
+                gsm_prepare()
+            if lte:
+                self._services_off([b for _nf, b in O5_NFS])
+                nfs = o5_prepare(mode == "csfb")
+                enb_prepare(mode == "csfb", self.dev_lte)
+                _run("systemctl", "start", "mongod")
+                e = hss_sync_all()
+                if e: self._log("pkom", "HSS: " + e)
+            if self.dev_gsm: self._log("pkom", "GSM-Funk: " + lime_label(self.dev_gsm))
+            if self.dev_lte: self._log("pkom", "LTE-Funk: " + lime_label(self.dev_lte))
             _lime_service("stop"); time.sleep(1); _free_lime(); time.sleep(2)
-            for name, binary, cfg in gsm_components():
-                flag = "-C" if binary.startswith("osmo-trx") else "-c"
-                self._spawn(binary, [flag, os.path.join(WORKDIR, cfg)], name)
-                time.sleep(4 if name in ("trx",) else 1.2)
-            time.sleep(1); gsm_apply_numbers()   # dauerhafte Rufnummern ins HLR schreiben
-            with self.lock: self.state = "laeuft"; self.msg = "GSM gestartet"
+            if gsm:
+                for name, binary, cfg in gsm_components():
+                    flag = "-C" if binary.startswith("osmo-trx") else "-c"
+                    self._spawn(binary, [flag, os.path.join(WORKDIR, cfg)], name)
+                    time.sleep(4 if name in ("trx",) else 1.2)
+                time.sleep(1); gsm_apply_numbers()   # SIMs + dauerhafte Rufnummern ins HLR
+            if lte:
+                ue_net_up()
+                for nf, (binary, path) in nfs.items():
+                    self._spawn(binary, ["-c", path], nf)
+                    time.sleep(1.5 if nf == "mme" else 0.8)
+                time.sleep(2)
+                self._spawn("srsenb", [os.path.join(WORKDIR, "enb.conf")], "enb")
+            with self.lock: self.state = "laeuft"; self.msg = MODES[mode] + " gestartet"
         except Exception as e:
-            with self.lock: self.state = "fehler"; self.msg = str(e)
+            with self.lock: self.state = "fehler"; self.msg = str(e)[:200]
             return str(e)
         return None
 
-    def start_lte(self):
-        with self.lock:
-            self.stop(); self.tech = "lte"; self.state = "startet"; self.msg=""
-            self.loglines = []; self.started = time.time()
-        if FAKE:
-            with self.lock: self.state = "laeuft"; self.msg = "LTE laeuft (FAKE)"
-            return None
-        try:
-            lte_prepare()
-            _lime_service("stop"); time.sleep(1); _free_lime(); time.sleep(2)
-            self._spawn("srsepc", [os.path.join(WORKDIR, "epc.conf"),
-                                   "--hss.db_file=" + os.path.join(WORKDIR, "user_db.csv")], "epc")
-            time.sleep(2)
-            self._spawn("srsenb", [os.path.join(WORKDIR, "enb.conf"),
-                                   "--enb_files.rr_config=" + os.path.join(WORKDIR, "rr.conf"),
-                                   "--enb_files.sib_config=" + os.path.join(WORKDIR, "sib.conf"),
-                                   "--enb_files.rb_config=" + os.path.join(WORKDIR, "rb.conf")], "enb")
-            with self.lock: self.state = "laeuft"; self.msg = "LTE gestartet"
-        except Exception as e:
-            with self.lock: self.state = "fehler"; self.msg = str(e)
-            return str(e)
-        return None
+    # Kompatibilitaet
+    def start_gsm(self): return self.start("gsm")
+    def start_lte(self): return self.start("lte")
 
-    def _prep_osmo_services_off(self):
-        for s in OSMO_SERVICES:
-            try: subprocess.run(["systemctl", "stop", s + ".service"],
+    def _services_off(self, names):
+        for s in names:
+            try: subprocess.run(["systemctl", "stop", s.replace("open5gs-", "open5gs-") + ".service"],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
             except Exception: pass
 
     def status(self):
         with self.lock:
             st = {
-                "tech": self.tech, "state": self.state, "msg": self.msg,
+                "tech": self.tech, "mode": MODES.get(self.tech or "", ""),
+                "state": self.state, "msg": self.msg,
                 "uptime": int(time.time() - self.started) if self.started and self.state == "laeuft" else 0,
-                "log": self.loglines[-60:],
+                "log": self.loglines[-80:],
                 "conf": dict(C),
+                "limes": LIMES,
+                "dev": {"gsm": lime_label(self.dev_gsm) if self.dev_gsm else "",
+                        "lte": lime_label(self.dev_lte) if self.dev_lte else ""},
                 "gsm": {
                     "arfcn": int(C["GSM_ARFCN"]), "band": arfcn_band(int(C["GSM_ARFCN"])),
                     "mhz": arfcn_mhz(int(C["GSM_ARFCN"])),
-                    "sims": gsm_sim_list() if self.tech == "gsm" else [],
+                    "attached": sorted(msc_attached()) if self.state == "laeuft" else [],
                     "numbers": nums_load(),
                 },
                 "lte": {
                     "earfcn": int(C["LTE_EARFCN"]), "band": earfcn_band(int(C["LTE_EARFCN"])),
-                    "mhz": earfcn_mhz(int(C["LTE_EARFCN"])), "sims": lte_sim_list(),
+                    "mhz": earfcn_mhz(int(C["LTE_EARFCN"])),
                 },
+                "sims": [{"imsi": i, "msisdn": s.get("msisdn", "")} for i, s in sorted(sims_load().items())],
+                "simfiles": sim_files(),
+                "tz": "UTC%+d:%02d%s" % (tz_now()[0], tz_now()[1], " +Sommerzeit" if tz_now()[2] else ""),
+                "clash": freq_clash(),
                 "fake": FAKE,
             }
         return st
@@ -603,32 +1022,33 @@ def handle_api(path, body):
     cmd = path.rsplit("/", 1)[-1]
     if cmd == "status":
         return NET.status()
-    if cmd == "start_gsm":
-        NET.start_gsm()
-    elif cmd == "start_lte":
-        NET.start_lte()
+    if cmd in ("start_gsm", "start_lte", "start_csfb"):
+        NET.start(cmd[6:])
     elif cmd == "stop":
         NET.stop()
+    elif cmd == "lime_scan":
+        n = len(lime_scan()); NET.msg = f"{n} LimeSDR gefunden"
     elif cmd == "set":
         # beliebige Konfig-Keys setzen (validiert light)
         for k, v in req.items():
             if k in DEFAULTS or k in C:
-                cset(k, str(v))
+                v = str(v).replace('"', "").replace("\n", " ").strip()
+                if k in ("MCC", "MNC", "LTE_TAC"): v = re.sub(r"\D", "", v)
+                cset(k, v)
         NET.msg = "gespeichert - wirkt beim naechsten Start"
-    elif cmd == "gsm_sim_add":
-        NET.msg = gsm_sim_add(req.get("imsi",""), req.get("ki",""), req.get("opc",""), req.get("msisdn","")) or "SIM gespeichert"
+        if C.get("GSM_DEV") and C.get("GSM_DEV") == C.get("LTE_DEV"):
+            NET.msg = "Achtung: GSM und LTE nutzen denselben LimeSDR - fuer LTE + GSM zwei Geraete waehlen"
+    elif cmd in ("sim_add", "gsm_sim_add", "lte_sim_add"):
+        NET.msg = sim_add(req.get("imsi",""), req.get("ki",""), req.get("opc",""), req.get("msisdn","")) \
+                  or "SIM gespeichert (GSM + LTE)"
+    elif cmd in ("sim_del", "gsm_sim_del", "lte_sim_del"):
+        sim_del(req.get("imsi","")); NET.msg = "SIM geloescht"
     elif cmd == "gsm_sim_nr":
         NET.msg = gsm_sim_nr(req.get("imsi",""), req.get("msisdn","")) or "Rufnummer dauerhaft zugewiesen"
     elif cmd == "gsm_num_del":
         gsm_num_del(req.get("imsi","")); NET.msg = "Rufnummer-Zuweisung geloescht"
-    elif cmd == "gsm_sim_del":
-        gsm_sim_del(req.get("imsi","")); NET.msg = "SIM geloescht"
     elif cmd == "sms_test":
         NET.msg = sms_test(req.get("imsi",""), req.get("text",""))
-    elif cmd == "lte_sim_add":
-        NET.msg = lte_sim_add(req.get("imsi",""), req.get("ki",""), req.get("opc",""), req.get("msisdn","")) or "SIM gespeichert"
-    elif cmd == "lte_sim_del":
-        lte_sim_del(req.get("imsi","")); NET.msg = "SIM geloescht"
     else:
         NET.msg = "unbekannt"
     return NET.status()
@@ -662,8 +1082,8 @@ border-bottom:1px solid var(--line2);padding:12px 20px;display:flex;align-items:
 .wrap{max-width:1060px;margin:0 auto;padding:22px 16px 44px}
 .banner{display:flex;gap:11px;align-items:flex-start;background:#0c1a3b;border:1px solid var(--line2);
 border-left:3px solid #f1b24a;color:#f2d79f;padding:12px 15px;font-size:13px;margin-bottom:18px}
-.controls{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;margin-bottom:20px}
-@media(max-width:640px){.controls{grid-template-columns:1fr}}
+.controls{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:10px;margin-bottom:20px}
+@media(max-width:820px){.controls{grid-template-columns:1fr 1fr}}@media(max-width:480px){.controls{grid-template-columns:1fr}}
 .bigbtn{border:1px solid var(--line2);background:#0b1836;color:var(--fg);
 padding:15px 18px;font:inherit;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:12px;transition:.15s}
 .bigbtn:hover{border-color:var(--acc);background:#0e1f47}.bigbtn .ic{font-size:16px;color:var(--acc)}
@@ -701,6 +1121,7 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
 .empty{color:var(--mut2);font-size:13px;padding:8px 0}
 .log{background:#030a18;border:1px solid var(--line);padding:14px;font:12px/1.55 var(--mono);height:440px;overflow:auto;white-space:pre-wrap;color:#9fb3d0}
 .toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px}.toolbar input{flex:1}
+.ef{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}.ef th{text-align:left;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.07em;padding:8px 6px;border-bottom:1px solid var(--line2)}.ef td{padding:10px 6px;border-bottom:1px solid var(--line);vertical-align:top}.ef code{font-family:var(--mono);color:var(--acc);word-break:break-all;user-select:all}.mut{color:var(--mut);font-size:11px}code{font-family:var(--mono)}@media(max-width:560px){.row,.row3{grid-template-columns:1fr}}
 </style></head><body>
 <header>
  <div class=brand><svg xmlns="http://www.w3.org/2000/svg" viewBox="-20 -20 668 330" role="img" aria-label="pKOM"><g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="32"><g stroke="#FFFFFF"><path d="M20 80 V266"></path><circle cx="72" cy="133" r="52"></circle><path d="M178 16 Q206 100 178 184"></path><path d="M192 100 C226 96 250 62 266 16"></path><path d="M492 184 V30 C522 30 534 106 552 106 C570 106 582 30 612 30 V184"></path></g><path stroke="#2EC4F1" d="M192 100 C233 102 256 183 363 183 A83 83 0 0 0 363 17 A83 83 0 0 0 282 118"></path></g></svg><span class=prod>Netzsteuerung</span></div>
@@ -713,11 +1134,12 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
  </div>
 </header>
 <div class=wrap>
- <div class=banner><span>⚠️</span><span><b>Nur abgeschottet betreiben</b> – Dummy Load / Kabel + Dämpfung / geschirmt. Offenes Netz ohne Authentisierung = IMSI-Catcher, wenn es abstrahlt. Nur eigene Test-SIMs, Testkennung 001/01 oder 999/99.</span></div>
+ <div class=banner><span>⚠️</span><span><b>Nur abgeschottet betreiben</b> – Dummy Load / Kabel + Dämpfung / geschirmt. Offenes Netz ohne Authentisierung = IMSI-Catcher, wenn es abstrahlt. Nur eigene Test-SIMs, Kennung 001/xx (Test) oder 999/xx (privat).</span></div>
 
  <div class=controls>
-  <button class=bigbtn id=btn_gsm onclick="cmd('start_gsm')"><span class=ic>▶</span><span>GSM (2G) starten<small id=gsm_sub>Osmocom</small></span></button>
-  <button class=bigbtn id=btn_lte onclick="cmd('start_lte')"><span class=ic>▶</span><span>LTE (4G) starten<small id=lte_sub>srsRAN</small></span></button>
+  <button class=bigbtn id=btn_gsm onclick="cmd('start_gsm')"><span class=ic>▶</span><span>GSM (2G)<small id=gsm_sub>Osmocom</small></span></button>
+  <button class=bigbtn id=btn_lte onclick="cmd('start_lte')"><span class=ic>▶</span><span>LTE (4G)<small id=lte_sub>srsRAN + Open5GS</small></span></button>
+  <button class=bigbtn id=btn_csfb onclick="cmd('start_csfb')"><span class=ic>▶</span><span>LTE + GSM<small id=csfb_sub>Internet + Anrufe (CSFB)</small></span></button>
   <button class="bigbtn stop" onclick="cmd('stop')">■ Stoppen</button>
  </div>
 
@@ -726,6 +1148,7 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
   <button class=tab data-t=gsm onclick="tab('gsm')">GSM · 2G</button>
   <button class=tab data-t=lte onclick="tab('lte')">LTE · 4G</button>
   <button class=tab data-t=sims onclick="tab('sims')">SIMs & Nummern</button>
+  <button class=tab data-t=profil onclick="tab('profil')">SIM-Profil</button>
   <button class=tab data-t=log onclick="tab('log')">Protokoll</button>
  </div>
 
@@ -738,17 +1161,36 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
      <div style=text-align:right><div class=big id=tech2>aus</div><div class=sm id=statesub></div></div>
     </div>
     <div class=hint id=uptimehint></div>
+    <div class=hint id=devhint></div>
+    <div class=hint id=clash style=color:var(--err)></div>
+   </div>
+   <div class=card>
+    <h2>Funk-Hardware</h2>
+    <p class=sub>Je Netz ein eigener LimeSDR. Für „LTE + GSM“ zwei verschiedene wählen.</p>
+    <label>LimeSDR für GSM (2G)</label><select id=GSM_DEV></select>
+    <label>LimeSDR für LTE (4G)</label><select id=LTE_DEV></select>
+    <div style=display:flex;gap:8px;flex-wrap:wrap>
+     <button class=btn onclick="save(['GSM_DEV','LTE_DEV'])">Speichern</button>
+     <button class="btn sec" onclick="cmd('lime_scan')">Neu suchen</button>
+    </div>
+    <div class=hint id=limelist></div>
    </div>
    <div class=card>
     <h2>Netz-Identität</h2>
-    <p class=sub>Gilt für GSM und LTE.</p>
-    <div class=row3>
-     <div><label>MCC</label><input id=MCC></div>
-     <div><label>MNC</label><input id=MNC></div>
-     <div><label>Netzname</label><input id=NETNAME></div>
+    <p class=sub>Gilt für GSM und LTE. Nur Testkennung 001/xx oder Privatkennung 999/xx.</p>
+    <div class=row>
+     <div><label>MCC</label><input id=MCC inputmode=numeric></div>
+     <div><label>MNC</label><input id=MNC inputmode=numeric></div>
     </div>
-    <label>SDR dev-args</label><input id=DEV_ARGS>
-    <button class="btn sec" onclick="save(['MCC','MNC','NETNAME','DEV_ARGS'])">Speichern</button>
+    <div class=row>
+     <div><label>Netzname (lang)</label><input id=NETNAME></div>
+     <div><label>Netzname (kurz)</label><input id=NETNAME_SHORT></div>
+    </div>
+    <label>Anbietername (SPN, max. 16 Zeichen)</label><input id=SPN maxlength=16>
+    <div class=sw><div class=t>NITZ senden<small>Netzname, Uhrzeit und Zeitzone (<span id=tz>–</span>) beim Einbuchen</small></div>
+     <label class=switch><input type=checkbox id=NITZ><span class=slider></span></label></div>
+    <button class="btn sec" onclick="save(['MCC','MNC','NETNAME','NETNAME_SHORT','SPN','NITZ'])">Speichern</button>
+    <p class=hint>Damit das iPhone das Netz als <b>Heimnetz</b> sieht (kein Roaming), muss die IMSI der eSIM mit MCC+MNC beginnen: <b class=tag id=hplmn>–</b>…</p>
    </div>
   </div>
  </div>
@@ -821,7 +1263,7 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
      <div><label>RX-Gain</label><input id=LTE_RX_GAIN></div></div>
     <label>APN</label><input id=LTE_APN>
     <button class=btn onclick="save(['LTE_TX_GAIN','LTE_RX_GAIN','LTE_APN'])">Speichern</button>
-    <p class=hint>LTE braucht SIMs mit Ki/OPc (Tab „SIMs"). srsRAN muss installiert sein.</p>
+    <p class=hint>LTE braucht SIMs mit Ki/OPc (Tab „SIMs“). Kern: Open5GS, Handy-Netz 10.45.0.0/16 mit NAT ins Internet. Bei „LTE + GSM“ darf die GSM-Frequenz nicht im LTE-Kanal liegen.</p>
    </div>
   </div>
  </div>
@@ -829,32 +1271,40 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
  <div class=panel id=p-sims>
   <div class=grid>
    <div class=card>
+    <h2>SIM eintragen</h2>
+    <p class=sub>Einmal eintragen – pKOM schreibt sie automatisch ins GSM-HLR und in den LTE-HSS.</p>
+    <div class=row><div><label>IMSI</label><input id=sim_imsi inputmode=numeric></div><div><label>Rufnummer</label><input id=sim_nr inputmode=numeric></div></div>
+    <div class=row><div><label>Ki (32 Hex)</label><input id=sim_ki autocomplete=off></div><div><label>OPc (32 Hex)</label><input id=sim_opc autocomplete=off></div></div>
+    <button class="btn sm" onclick="simadd()">SIM speichern</button>
+    <div style=margin-top:12px id=sims></div>
+   </div>
+   <div class=card>
+    <h2>Eingebuchte Handys</h2>
+    <p class=sub>Aktuell im Sprachnetz (MSC) angemeldet – bei „LTE + GSM“ auch über LTE/SGs.</p>
+    <div id=attached></div>
+   </div>
+   <div class=card>
     <h2>Nummer dauerhaft zuweisen</h2>
-    <p class=sub>Auch für offen angemeldete SIMs ohne Ki – überlebt Neustarts.</p>
+    <p class=sub>Auch für offen angemeldete GSM-SIMs ohne Ki – überlebt Neustarts.</p>
     <div class=row><div><label>IMSI</label><input id=gnum_imsi></div><div><label>Rufnummer</label><input id=gnum_nr></div></div>
     <button class="btn sm" onclick="simnr()">Zuweisen</button>
     <div style=margin-top:12px id=gsm_numbers></div>
    </div>
-   <div class=card>
-    <h2>Eingebuchte Handys</h2>
-    <p class=sub>Aktuell im GSM-Netz angemeldet.</p>
-    <div id=gsm_sims></div>
-   </div>
-   <div class=card>
-    <h2>GSM-SIM mit Schlüssel</h2>
-    <p class=sub>Eigene Test-SIM (Ki/OPc bekannt).</p>
-    <div class=row><div><label>IMSI</label><input id=gsim_imsi></div><div><label>Rufnummer</label><input id=gsim_nr></div></div>
-    <div class=row><div><label>Ki (32 Hex)</label><input id=gsim_ki></div><div><label>OPc (32 Hex)</label><input id=gsim_opc></div></div>
-    <button class="btn sm" onclick="simadd('gsm')">SIM speichern</button>
-   </div>
-   <div class=card>
-    <h2>LTE-SIMs</h2>
-    <p class=sub>LTE erfordert Ki/OPc.</p>
-    <div class=row><div><label>IMSI</label><input id=lsim_imsi></div><div><label>Rufnummer</label><input id=lsim_nr></div></div>
-    <div class=row><div><label>Ki (32 Hex)</label><input id=lsim_ki></div><div><label>OPc (32 Hex)</label><input id=lsim_opc></div></div>
-    <button class="btn sm" onclick="simadd('lte')">SIM speichern</button>
-    <div style=margin-top:12px id=lte_sims></div>
-   </div>
+  </div>
+ </div>
+
+ <div class=panel id=p-profil>
+  <div class=card>
+   <h2>Werte für das eSIM-Profil</h2>
+   <p class=sub>OPL, PNN und SPN sind Dateien <b>auf der SIM</b> – das Netz kann sie nicht setzen. Diese Werte passen zu Kennung und Netzname oben und werden im eSIM-Profil (z.&nbsp;B. simlessly) eingetragen. NITZ schickt pKOM selbst.</p>
+   <table class=ef>
+    <tr><th>Datei</th><th>Inhalt</th><th>Wert (Hex)</th></tr>
+    <tr><td><b>SPN</b><br><span class=mut>EF 6F46</span></td><td id=ef_spn_t></td><td><code id=ef_spn></code></td></tr>
+    <tr><td><b>PNN</b><br><span class=mut>EF 6FC5, Eintrag 1</span></td><td id=ef_pnn_t></td><td><code id=ef_pnn></code></td></tr>
+    <tr><td><b>OPL</b><br><span class=mut>EF 6FC6, Eintrag 1</span></td><td id=ef_opl_t></td><td><code id=ef_opl></code></td></tr>
+    <tr><td><b>HPLMN</b><br><span class=mut>IMSI-Anfang</span></td><td>Heimnetz-Kennung</td><td><code id=ef_hplmn></code></td></tr>
+   </table>
+   <p class=hint>Datensätze bei fester Länge mit <code>FF</code> auffüllen. In der USIM-Diensttabelle (UST) müssen die Dienste <b>17</b> (SPN), <b>45</b> (PNN) und <b>46</b> (OPL) aktiv sein. Ändern sich Kennung oder Name, die Werte hier neu übernehmen.</p>
   </div>
  </div>
 
@@ -869,42 +1319,62 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
 let S={};
 async function api(c,b){const r=await fetch('/api/'+c,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
 function $(i){return document.getElementById(i);}
-function cmd(c){api(c).then(render);}
-function tab(n){document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('sel',t.dataset.t===n));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('sel',p.id==='p-'+n));}
-function save(keys){let b={};keys.forEach(k=>{let el=$(k);b[k]=el.type==='checkbox'?(el.checked?'1':'0'):el.value;});api('set',b).then(render);}
-function simadd(t){const p=t==='gsm'?'gsim':'lsim';api(t+'_sim_add',{imsi:$(p+'_imsi').value,ki:$(p+'_ki').value,opc:$(p+'_opc').value,msisdn:$(p+'_nr').value}).then(render);}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function cmd(c){if(c.startsWith('start'))$('msg').textContent='startet…';api(c).then(r=>{if(c==='lime_scan')limeKey='';render(r);});}
+function tab(n){document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('sel',t.dataset.t===n));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('sel',p.id==='p-'+n));try{localStorage.setItem('pkom_tab',n);}catch(e){}}
+function save(keys){let b={};keys.forEach(k=>{let el=$(k);b[k]=el.type==='checkbox'?(el.checked?'1':'0'):el.value;});api('set',b).then(r=>{filled=false;render(r);});}
+function simadd(){api('sim_add',{imsi:$('sim_imsi').value,ki:$('sim_ki').value,opc:$('sim_opc').value,msisdn:$('sim_nr').value}).then(r=>{if(!/aber|pruefen/.test(r.msg||'')){['sim_imsi','sim_ki','sim_opc','sim_nr'].forEach(i=>$(i).value='');}render(r);});}
 function simnr(){api('gsm_sim_nr',{imsi:$('gnum_imsi').value,msisdn:$('gnum_nr').value}).then(render);}
 function smstest(){api('sms_test',{imsi:$('sms_test_imsi').value,text:$('sms_test_text').value}).then(render);}
-function simdel(t,i){api(t+'_sim_del',{imsi:i}).then(render);}
+function simdel(i){if(confirm('SIM '+i+' aus GSM und LTE löschen?'))api('sim_del',{imsi:i}).then(render);}
 function numdel(i){api('gsm_num_del',{imsi:i}).then(render);}
 function gsmInfo(a){a=+a||0;let m=0,b='';if(a>=1&&a<=124){m=935+0.2*a;b='GSM900';}else if(a>=512&&a<=885){m=1805.2+0.2*(a-512);b='DCS1800';}return{mhz:m?m.toFixed(1)+' MHz':'–',band:b};}
 function lteInfo(e){e=+e||0;let m=0,b=0;if(e>=0&&e<=599){m=2110+0.1*e;b=1;}else if(e>=1200&&e<=1949){m=1805+0.1*(e-1200);b=3;}else if(e>=2750&&e<=3449){m=2620+0.1*(e-2750);b=7;}else if(e>=6150&&e<=6449){m=791+0.1*(e-6150);b=20;}return{mhz:m?m.toFixed(1)+' MHz':'–',band:b?'Band '+b:''};}
 function updateFreq(){let g=gsmInfo($('GSM_ARFCN').value);$('gsm_mhz').textContent=g.mhz;$('gsm_band').textContent=g.band;let l=lteInfo($('LTE_EARFCN').value);$('lte_mhz').textContent=l.mhz;$('lte_band').textContent=l.band;}
 function setv(id,v){let el=$(id);if(!el)return;if(el.type==='checkbox')el.checked=(v==='1'||v===true);else el.value=(v==null?'':v);}
-const FIELDS=['MCC','MNC','NETNAME','DEV_ARGS','GSM_ARFCN','GSM_TX_GAIN','GSM_RX_GAIN','GSM_SIP_PEER','GSM_SIP_LOCAL','GSM_OPEN','GSM_DATA','GSM_SIP','GSM_SMS','GSM_SMS_FROM','GSM_SMS_EXTPREFIX','GSM_SMS_WELCOME','GSM_SMS_NUMBER','LTE_EARFCN','LTE_NPRB','LTE_TX_GAIN','LTE_RX_GAIN','LTE_APN'];
-let filled=false;
-function reloadFields(){const c=S.conf||{};FIELDS.forEach(k=>setv(k,c[k]));filled=true;updateFreq();}
+const FIELDS=['MCC','MNC','NETNAME','NETNAME_SHORT','SPN','NITZ','GSM_DEV','LTE_DEV','GSM_ARFCN','GSM_TX_GAIN','GSM_RX_GAIN','GSM_SIP_PEER','GSM_SIP_LOCAL','GSM_OPEN','GSM_DATA','GSM_SIP','GSM_SMS','GSM_SMS_FROM','GSM_SMS_EXTPREFIX','GSM_SMS_WELCOME','GSM_SMS_NUMBER','LTE_EARFCN','LTE_NPRB','LTE_TX_GAIN','LTE_RX_GAIN','LTE_APN'];
+let filled=false,limeKey='';
+function limeOptions(s){
+ const L=s.limes||[],c=s.conf||{},key=JSON.stringify(L)+(c.GSM_DEV||'')+(c.LTE_DEV||'');
+ if(key===limeKey)return;limeKey=key;
+ ['GSM_DEV','LTE_DEV'].forEach(id=>{const el=$(id),cur=c[id]||'';
+  let o='<option value="">automatisch</option>'+L.map(d=>'<option value="'+esc(d.serial)+'">'+esc(d.name)+' · '+esc(d.serial)+(d.media?' · '+esc(d.media):'')+'</option>').join('');
+  if(cur&&!L.some(d=>d.serial===cur))o+='<option value="'+esc(cur)+'">'+esc(cur)+' (nicht gefunden)</option>';
+  el.innerHTML=o;el.value=cur;});
+ $('limelist').textContent=L.length?L.length+' LimeSDR angeschlossen':'Kein LimeSDR gefunden – USB prüfen und „Neu suchen“.';
+}
+function reloadFields(){const c=S.conf||{};FIELDS.forEach(k=>{if(document.activeElement!==$(k))setv(k,c[k]);});filled=true;updateFreq();}
 function fmt(s){const m=Math.floor(s/60),h=Math.floor(m/60);return h?h+'h '+(m%60)+'m':(m?m+'m '+(s%60)+'s':s+'s');}
 function renderlog(){const f=($('logfilter').value||'').toLowerCase();let L=(S.log||[]);if(f)L=L.filter(x=>x.toLowerCase().includes(f));const lg=$('log');const near=lg.scrollTop+lg.clientHeight>=lg.scrollHeight-40;lg.textContent=L.join('\n');$('logcount').textContent=L.length+' Zeilen';if(near)lg.scrollTop=lg.scrollHeight;}
-function render(s){S=s;if(!filled)reloadFields();
- const run=s.state==='laeuft';
+function render(s){S=s;limeOptions(s);if(!filled)reloadFields();
+ const run=s.state==='laeuft',t=s.tech;
  $('dot').className='dot '+(run?'on':(s.state==='fehler'?'err':''));
  $('state').textContent=s.state;$('msg').textContent=s.msg||'';
- const tb=$('techbadge');if(s.tech){tb.style.display='';tb.textContent=s.tech.toUpperCase();}else tb.style.display='none';
+ const tb=$('techbadge');if(t){tb.style.display='';tb.textContent=t==='csfb'?'LTE+GSM':t.toUpperCase();}else tb.style.display='none';
  let freq='–',fsub='';
- if(s.tech==='lte'){freq=s.lte.mhz+' MHz';fsub='Band '+s.lte.band+' · EARFCN '+s.lte.earfcn;}
- else if(s.tech==='gsm'){freq=s.gsm.mhz+' MHz';fsub=s.gsm.band+' · ARFCN '+s.gsm.arfcn;}
+ const gf=s.gsm.mhz+' MHz',lf=s.lte.mhz+' MHz';
+ if(t==='lte'){freq=lf;fsub='Band '+s.lte.band+' · EARFCN '+s.lte.earfcn;}
+ else if(t==='gsm'){freq=gf;fsub=s.gsm.band+' · ARFCN '+s.gsm.arfcn;}
+ else if(t==='csfb'){freq=lf+' / '+gf;fsub='LTE B'+s.lte.band+' · GSM ARFCN '+s.gsm.arfcn;}
  $('freq').textContent=freq;$('freq2').textContent=freq;$('freqsub').textContent=fsub;
- $('tech2').textContent=s.tech?s.tech.toUpperCase():'aus';$('statesub').textContent=s.state;
+ $('tech2').textContent=t?(t==='csfb'?'LTE+GSM':t.toUpperCase()):'aus';$('statesub').textContent=s.state;
  $('uptime').textContent=s.uptime?fmt(s.uptime):'–';$('uptimehint').textContent=run?('läuft seit '+fmt(s.uptime)):'';
- $('btn_gsm').classList.toggle('active',s.tech==='gsm');$('btn_lte').classList.toggle('active',s.tech==='lte');
- $('gsm_sub').textContent=s.tech==='gsm'?'läuft':'Osmocom';$('lte_sub').textContent=s.tech==='lte'?'läuft':'srsRAN';
- $('gsm_numbers').innerHTML=Object.entries(s.gsm.numbers||{}).map(e=>'<div class=listrow><span class=tag>'+e[0]+' → <b>'+e[1]+'</b></span><button class=x onclick="numdel(\''+e[0]+'\')">löschen</button></div>').join('')||'<div class=empty>keine Zuweisungen</div>';
- $('gsm_sims').innerHTML=(s.gsm.sims||[]).map(i=>'<div class=listrow><span class=tag>'+i+'</span><button class=x onclick="simdel(\'gsm\',\''+i+'\')">löschen</button></div>').join('')||'<div class=empty>keine eingebucht</div>';
- $('lte_sims').innerHTML=(s.lte.sims||[]).map(i=>'<div class=listrow><span class=tag>'+i+'</span><button class=x onclick="simdel(\'lte\',\''+i+'\')">löschen</button></div>').join('')||'<div class=empty>keine</div>';
+ $('devhint').innerHTML=[s.dev.gsm?'GSM-Funk: <b>'+esc(s.dev.gsm)+'</b>':'',s.dev.lte?'LTE-Funk: <b>'+esc(s.dev.lte)+'</b>':''].filter(Boolean).join('<br>');
+ $('clash').textContent=s.clash||'';
+ [['gsm','Osmocom'],['lte','srsRAN + Open5GS'],['csfb','Internet + Anrufe (CSFB)']].forEach(([k,d])=>{$('btn_'+k).classList.toggle('active',t===k);$(k+'_sub').textContent=t===k?'läuft':d;});
+ $('tz').textContent=s.tz||'–';
+ const f=s.simfiles||{};$('hplmn').textContent=f.hplmn||'–';
+ $('ef_spn').textContent=f.spn||'';$('ef_spn_t').textContent='„'+(f.spn_text||'')+'“';
+ $('ef_pnn').textContent=f.pnn||'';$('ef_pnn_t').textContent='lang „'+(f.full||'')+'“, kurz „'+(f.short||'')+'“';
+ $('ef_opl').textContent=f.opl||'';$('ef_opl_t').textContent='Kennung '+(f.hplmn||'')+', alle Gebiete → PNN 1';
+ $('ef_hplmn').textContent=f.hplmn||'';
+ $('gsm_numbers').innerHTML=Object.entries(s.gsm.numbers||{}).map(e=>'<div class=listrow><span class=tag>'+esc(e[0])+' → <b>'+esc(e[1])+'</b></span><button class=x onclick="numdel(\''+esc(e[0])+'\')">löschen</button></div>').join('')||'<div class=empty>keine Zuweisungen</div>';
+ $('attached').innerHTML=(s.gsm.attached||[]).map(i=>'<div class=listrow><span class=tag>'+esc(i)+'</span><span class=tag>'+esc((s.gsm.numbers||{})[i]||'')+'</span></div>').join('')||'<div class=empty>keine eingebucht</div>';
+ $('sims').innerHTML=(s.sims||[]).map(x=>'<div class=listrow><span class=tag>'+esc(x.imsi)+' · <b>'+esc(x.msisdn)+'</b></span><button class=x onclick="simdel(\''+esc(x.imsi)+'\')">löschen</button></div>').join('')||'<div class=empty>noch keine SIM eingetragen</div>';
  renderlog();
 }
 async function poll(){try{render(await api('status'));}catch(e){}}
+try{const t=localStorage.getItem('pkom_tab');if(t&&$('p-'+t))tab(t);}catch(e){}
 poll();setInterval(poll,2500);
 </script></body></html>"""
 
@@ -940,6 +1410,9 @@ def main():
     port = int(C.get("WEB_PORT", "8080"))
     log(f"g90net Web-Oberflaeche auf http://0.0.0.0:{port}  (FAKE={FAKE})")
     threading.Thread(target=sms_welcome_watch, daemon=True).start()
+    threading.Thread(target=lime_scan, daemon=True).start()   # LimeSDR fuer die Auswahl suchen
+    try: _migrate_lte_db()
+    except Exception as e: log("migration:", e)
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 if __name__ == "__main__":

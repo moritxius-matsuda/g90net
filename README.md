@@ -1,8 +1,8 @@
 # g90net
 
 Steuer-Daemon mit Weboberfläche für ein eigenes **GSM (2G)- und LTE (4G)-Versuchsnetz**
-auf Basis von [Osmocom](https://osmocom.org) (2G), [srsRAN](https://www.srsran.com) (4G)
-und einem **LimeSDR**. Läuft auf Debian 13 / Raspberry Pi OS, bedient wird alles im Browser.
+auf Basis von [Osmocom](https://osmocom.org) (2G), [srsRAN](https://www.srsran.com) +
+[Open5GS](https://open5gs.org) (4G) und **LimeSDR**. Läuft auf Debian 13, bedient wird alles im Browser.
 
 Dies ist die Software hinter dem portablen Versuchsnetz **pKOM**.
 
@@ -12,18 +12,26 @@ http://<IP-des-Rechners>:8080
 
 ## Funktionen
 
-- **2G (Osmocom)** oder **4G (srsRAN)** per Klick starten/stoppen – ein Daemon steuert alle
-  Komponenten (osmo-stp/hlr/mgw/msc/bsc/bts-trx/trx-lms, optional pcu/sgsn/ggsn, sip-connector).
-- **Frequenz, Kennung (MCC/MNC), Sendeleistung/Gain** über die Weboberfläche.
-- **SIM- und Rufnummernverwaltung** (osmo-hlr), Zuweisungen überleben Neustarts.
+- Drei Betriebsarten per Klick:
+  - **GSM (2G)** – Osmocom (osmo-stp/hlr/mgw/msc/bsc/bts-trx/trx-lms, optional pcu/sgsn/ggsn, sip-connector)
+  - **LTE (4G)** – srsENB als Funk, Open5GS als Kern (MME/HSS/PCRF/SGW/SMF/UPF), Internet per NAT
+  - **LTE + GSM (CSFB)** – beide Netze gleichzeitig auf **zwei LimeSDR**. Das Handy bucht
+    sich kombiniert in 4G ein (Internet), Anrufe fallen über die **SGs-Schnittstelle**
+    (Open5GS-MME ↔ osmo-msc) kurz auf GSM zurück und laufen über den SIP-Trunk.
+    SMS gehen direkt über SGs. srsENB leitet per SIB7/RRC-Release auf die GSM-Frequenz um.
+- **LimeSDR-Auswahl je Netz** im Webinterface (z. B. LimeSDR Mini für GSM, LimeSDR USB für LTE).
+- **SIMs nur einmal eintragen** – pKOM schreibt sie automatisch ins osmo-hlr (GSM) und in
+  den Open5GS-HSS (LTE, MongoDB). Ki/OPc bleiben auf dem Rechner.
+- **Netzkennung** (nur Test-MCC 001 oder Privat-MCC 999), Netzname lang/kurz, Anbietername.
+- **NITZ** – Netzname, Uhrzeit und Zeitzone ans Handy (GSM: MM-Information, LTE: EMM-Information).
+- **SIM-Profil** – fertige Hex-Werte für **SPN**, **PNN** und **OPL** zum Eintragen ins eSIM-Profil.
 - **SIP-Trunk** zu einer Asterisk-Telefonanlage (osmo-sip-connector).
 - **SMS** – Willkommensnachricht beim Einbuchen und Bestätigung bei Nummernvergabe.
   Platzhalter in den Texten:
   - `{netz}` – Netzname
   - `{nummer}` – interne Rufnummer
   - `{extern}` – extern erreichbare Nummer (Vorwahl-Block + interne Nummer)
-- **Datenverkehr** (EDGE/GPRS bzw. LTE) mit NAT ins Uplink-Netz.
-- Reines Python (Standardbibliothek), eine Datei: `g90net.py`.
+- Eine Python-Datei: `g90net.py` (Standardbibliothek + python3-yaml/python3-pymongo für LTE).
 
 ## Installation
 
