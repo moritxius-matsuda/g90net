@@ -805,7 +805,7 @@ def o5_prepare(csfb, etc=O5_ETC, outdir=O5_DIR):
 
 def _srs_template(name):
     for p in (os.path.join(SRS_CFG, name), f"/usr/share/srsran/{name}.example",
-              f"/usr/share/srsran/{name}", f"/usr/share/doc/srsran/examples/{name}.example"):
+              f"/usr/share/srsran/{name}", f"/usr/local/share/srsran/{name}.example", f"/usr/share/doc/srsran/examples/{name}.example"):
         if os.path.isfile(p): return p
     return None
 

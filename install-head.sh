@@ -57,7 +57,6 @@ apt-get install -y -qq limesuite liblimesuite-dev soapysdr-tools soapysdr-module
 
 OSMO_BINS="osmo-trx-lms osmo-bts-trx osmo-bsc osmo-mgw osmo-msc osmo-hlr osmo-stp osmo-sip-connector osmo-pcu osmo-sgsn osmo-ggsn"
 have_osmo() { for b in $OSMO_BINS; do command -v "$b" >/dev/null 2>&1 || return 1; done; }
-have_srs()  { command -v srsenb >/dev/null 2>&1 && command -v srsepc >/dev/null 2>&1; }
 
 info "Osmocom (2G) installieren"
 apt-get install -y -qq $OSMO_BINS 2>/dev/null || true
@@ -77,8 +76,29 @@ fi
 have_osmo || warn "Nicht alle Osmocom-Binaries vorhanden - GSM meldet beim Start, was fehlt."
 
 info "srsRAN (4G-Funk) installieren"
-apt-get install -y -qq srsran 2>/dev/null || apt-get install -y -qq srslte 2>/dev/null || true
-command -v srsenb >/dev/null 2>&1 || warn "srsenb nicht gefunden - 4G erst nach 'apt install srsran'."
+# Debian 13 hat kein srsRAN-Paket mehr -> einmalig aus dem Quelltext bauen (dauert 20-60 min)
+apt-get install -y -qq srsran 2>/dev/null || true
+if ! command -v srsenb >/dev/null 2>&1; then
+  info "srsRAN 4G aus dem Quelltext bauen (einmalig, bitte warten)"
+  apt-get install -y -qq build-essential cmake git pkg-config libfftw3-dev libmbedtls-dev     libboost-program-options-dev libconfig++-dev libsctp-dev libsoapysdr-dev 2>/dev/null     || warn "Build-Pakete fuer srsRAN unvollstaendig"
+  SRC=/usr/local/src/srsRAN_4G
+  if [[ -d $SRC/.git ]]; then git -C $SRC pull -q --ff-only || true
+  else git clone -q --depth 1 https://github.com/srsran/srsRAN_4G.git $SRC || warn "srsRAN-Quelltext nicht ladbar"; fi
+  if [[ -d $SRC ]]; then
+    MEMG=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1048576 ))
+    J=$(nproc); (( J > MEMG / 2 )) && J=$(( MEMG / 2 )); (( J < 1 )) && J=1
+    mkdir -p $SRC/build && cd $SRC/build
+    if cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_WERROR=OFF -DENABLE_UHD=OFF -DENABLE_BLADERF=OFF          -DENABLE_ZEROMQ=OFF -DENABLE_SOAPYSDR=ON -DENABLE_RF_PLUGINS=ON >/tmp/srsran-build.log 2>&1        && make -j"$J" srsenb >>/tmp/srsran-build.log 2>&1 && make -j"$J" >>/tmp/srsran-build.log 2>&1        ; then
+      make install >>/tmp/srsran-build.log 2>&1 && ldconfig
+      grep -q "SoapySDR" /tmp/srsran-build.log || warn "srsRAN ohne SoapySDR gebaut - LimeSDR fehlt (libsoapysdr-dev?)"
+    else
+      # Tests duerfen scheitern, solange srsenb selbst gebaut ist
+      [[ -x srsenb/src/srsenb ]] && { make install >>/tmp/srsran-build.log 2>&1 || cp srsenb/src/srsenb /usr/local/bin/; ldconfig; }         || warn "srsRAN-Build fehlgeschlagen - siehe /tmp/srsran-build.log"
+    fi
+    cd /
+  fi
+fi
+command -v srsenb >/dev/null 2>&1 && info "srsenb: $(command -v srsenb)" || warn "srsenb fehlt - 4G nicht moeglich (Log: /tmp/srsran-build.log)."
 
 # ---- Open5GS (4G-Kern mit SGs fuer CSFB) + MongoDB (Teilnehmer-DB) --------
 info "Python-Module fuer Open5GS-Steuerung"
@@ -102,22 +122,55 @@ if ! have_o5; then
 fi
 have_o5 || warn "Open5GS fehlt - LTE und 'LTE + GSM' melden beim Start, was fehlt."
 
+# MongoDB: ab 5.0 ist AVX Pflicht. Ohne AVX -> MongoDB 4.4 (letzte Version ohne AVX)
+MONGO44=mongodb-linux-x86_64-debian10-4.4.29
+MONGO44_SHA=dd254701bebe1050f96cbb6928f0c7f66b541747dcf4881e4517cb1f435c2b8e
+SSL11=libssl1.1_1.1.1w-0+deb11u1_amd64.deb
+SSL11_SHA=aadf8b4b197335645b230c2839b4517aa444fd2e8f434e5438c48a18857988f7
+mongo44() {
+  info "CPU ohne AVX - installiere MongoDB 4.4 (laeuft ohne AVX, nur lokal auf 127.0.0.1)"
+  apt-get install -y -qq libcurl4t64 2>/dev/null || apt-get install -y -qq libcurl4 2>/dev/null || true
+  local T; T=$(mktemp -d)
+  if ! ldconfig -p | grep -q 'libssl.so.1.1 '; then
+    curl -fsSL -o "$T/$SSL11" "https://deb.debian.org/debian/pool/main/o/openssl/$SSL11"       && echo "$SSL11_SHA  $T/$SSL11" | sha256sum -c --quiet       && dpkg -i "$T/$SSL11" >/dev/null 2>&1 || { warn "libssl1.1 nicht installierbar"; rm -rf "$T"; return 1; }
+  fi
+  curl -fsSL -o "$T/m.tgz" "https://fastdl.mongodb.org/linux/$MONGO44.tgz"     && echo "$MONGO44_SHA  $T/m.tgz" | sha256sum -c --quiet     || { warn "MongoDB 4.4 Download/Pruefsumme fehlgeschlagen"; rm -rf "$T"; return 1; }
+  tar xzf "$T/m.tgz" -C "$T" && install -m 755 "$T/$MONGO44/bin/mongod" /usr/local/bin/mongod
+  rm -rf "$T"
+  id mongodb >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -d /var/lib/mongodb mongodb
+  mkdir -p /var/lib/mongodb /var/log/mongodb && chown mongodb: /var/lib/mongodb /var/log/mongodb
+  cat > /etc/systemd/system/mongod.service <<'MUNIT'
+[Unit]
+Description=MongoDB 4.4 (pKOM Teilnehmer-DB, ohne AVX)
+After=network.target
+[Service]
+User=mongodb
+ExecStart=/usr/local/bin/mongod --bind_ip 127.0.0.1 --port 27017 --dbpath /var/lib/mongodb --logpath /var/log/mongodb/mongod.log --logappend
+Restart=on-failure
+LimitNOFILE=64000
+[Install]
+WantedBy=multi-user.target
+MUNIT
+  systemctl daemon-reload
+}
 if ! command -v mongod >/dev/null 2>&1; then
   if [[ $(uname -m) == x86_64 ]] && ! grep -qw avx /proc/cpuinfo; then
-    warn "CPU ohne AVX: aktuelle MongoDB laeuft hier nicht - LTE-Teilnehmer-DB nicht moeglich."
+    mongo44 || warn "MongoDB fehlt - LTE-Teilnehmer-DB nicht moeglich."
   else
     info "MongoDB (Teilnehmer-DB fuer Open5GS) installieren"
     curl -fsSL https://pgp.mongodb.com/server-8.0.asc | gpg --dearmor > /usr/share/keyrings/mongodb-8.0.gpg 2>/dev/null || true
     for CN in trixie bookworm; do
-      echo "deb [signed-by=/usr/share/keyrings/mongodb-8.0.gpg] https://repo.mongodb.org/apt/debian ${CN}/mongodb-org/8.0 main" \
-        > /etc/apt/sources.list.d/mongodb-org-8.0.list
+      echo "deb [signed-by=/usr/share/keyrings/mongodb-8.0.gpg] https://repo.mongodb.org/apt/debian ${CN}/mongodb-org/8.0 main"         > /etc/apt/sources.list.d/mongodb-org-8.0.list
       apt-get update -qq 2>/dev/null && apt-get install -y -qq mongodb-org 2>/dev/null || true
       command -v mongod >/dev/null 2>&1 && { info "MongoDB aus Zweig $CN"; break; }
     done
     command -v mongod >/dev/null 2>&1 || { rm -f /etc/apt/sources.list.d/mongodb-org-8.0.list; warn "MongoDB nicht installierbar"; }
   fi
 fi
-command -v mongod >/dev/null 2>&1 && systemctl enable --now mongod >/dev/null 2>&1 || true
+if command -v mongod >/dev/null 2>&1; then
+  systemctl enable --now mongod >/dev/null 2>&1 || true
+  sleep 3; systemctl is-active --quiet mongod && info "MongoDB laeuft" || warn "mongod startet nicht - 'journalctl -u mongod'"
+fi
 
 # SCTP (S1AP + SGs) beim Booten laden
 modprobe sctp 2>/dev/null || warn "Kernelmodul sctp nicht ladbar"
@@ -135,7 +188,7 @@ done
 # srsRAN: Beispielkonfigs nachziehen
 for f in enb.conf rr.conf sib.conf rb.conf epc.conf; do
   if [[ ! -f /etc/srsran/$f ]]; then
-    src=$(find /usr/share/srsran /usr/share/doc -name "$f*" 2>/dev/null | grep -iE 'srs|enb|epc' | head -1)
+    src=$(find /usr/local/share/srsran /usr/share/srsran /usr/share/doc -name "$f*" 2>/dev/null | grep -iE 'srs|enb|epc' | head -1)
     [[ -n "$src" ]] && cp "$src" /etc/srsran/$f 2>/dev/null || true
   fi
 done
