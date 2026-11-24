@@ -25,6 +25,7 @@ http://<IP-des-Rechners>:8080
 - **Netzkennung** (nur Test-MCC 001 oder Privat-MCC 999), Netzname lang/kurz, Anbietername.
 - **NITZ** – Netzname, Uhrzeit und Zeitzone ans Handy (GSM: MM-Information, LTE: EMM-Information).
 - **SIM-Profil** – fertige Hex-Werte für **SPN**, **PNN** und **OPL** zum Eintragen ins eSIM-Profil.
+- **Bandauswahl** – GSM 850/900/E-900/1800/1900 und 14 LTE-FDD-Bänder (1, 2, 3, 4, 5, 7, 8, 12, 13, 17, 20, 25, 26, 28) mit Down-/Uplink-Anzeige und Prüfung, ob der Kanal ins Band passt.
 - **Neustarten einzelner Teile** – GSM, 4G komplett, nur der 4G-Funk (eNB) oder einzelne Prozesse (z. B. msc, mme), ohne das Netz anzuhalten.
 - **SIM-Daten erzeugen** – IMSI (passend zu MCC/MNC), Ki, OP und OPc (Milenage), ICCID mit Luhn-Prüfziffer, PIN/PUK/ADM1; mit einem Klick in pKOM übernehmen oder als CSV/JSON speichern.
 - **SIP-Trunk** zu einer Asterisk-Telefonanlage (osmo-sip-connector).

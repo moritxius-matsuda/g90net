@@ -28,7 +28,7 @@ DEFAULTS = {
     # LimeSDR je Netz (Seriennummer, leer = automatisch)
     "GSM_DEV": "", "LTE_DEV": "",
     # 2G
-    "GSM_ARFCN": "20", "GSM_TX_GAIN": "50", "GSM_RX_GAIN": "45",
+    "GSM_ARFCN": "20", "GSM_BAND": "", "GSM_TX_GAIN": "50", "GSM_RX_GAIN": "45",
     "GSM_OPEN": "1", "GSM_DATA": "0", "GSM_SIP": "0", "GSM_SIP_PEER": "", "GSM_SIP_LOCAL": "",
     # SMS (Begruessung beim Einbuchen + Bestaetigung bei Nummernvergabe)
     "GSM_SMS": "1", "GSM_SMS_FROM": "1000",
@@ -77,40 +77,72 @@ def log(*a):
 FAKE = "--fake" in sys.argv   # Testmodus ohne echte Hardware/Prozesse
 
 # ------------------------------------------------------------------ Frequenzen (Anzeige)
+# GSM-Baender: id -> (Anzeige, Osmocom-Bandname, ARFCN-Bereiche, DL(MHz) bei ARFCN, Duplexabstand)
+GSM_BANDS = {
+    "GSM850":  ("GSM 850",       "GSM850",  [(128, 251)],            lambda a: 869.2 + 0.2 * (a - 128), 45),
+    "GSM900":  ("GSM 900 (P)",   "GSM900",  [(1, 124)],              lambda a: 935.0 + 0.2 * a, 45),
+    "EGSM900": ("E-GSM 900",     "GSM900",  [(0, 124), (975, 1023)], lambda a: 935.0 + 0.2 * (a if a <= 124 else a - 1024), 45),
+    "DCS1800": ("DCS 1800",      "DCS1800", [(512, 885)],            lambda a: 1805.2 + 0.2 * (a - 512), 95),
+    "PCS1900": ("PCS 1900",      "PCS1900", [(512, 810)],            lambda a: 1930.2 + 0.2 * (a - 512), 80),
+}
+# LTE-FDD-Baender (srsRAN 4G kann nur FDD): Band -> (Name, DL-Start MHz, N_Offs-DL, EARFCN von, bis, Duplex MHz)
+LTE_BANDS = {
+    1:  ("2100",      2110.0,    0,    0,  599, 190),
+    2:  ("1900 PCS",  1930.0,  600,  600, 1199,  80),
+    3:  ("1800",      1805.0, 1200, 1200, 1949,  95),
+    4:  ("AWS 1700",  2110.0, 1950, 1950, 2399, 400),
+    5:  ("850",        869.0, 2400, 2400, 2649,  45),
+    7:  ("2600",      2620.0, 2750, 2750, 3449, 120),
+    8:  ("900",        925.0, 3450, 3450, 3799,  45),
+    12: ("700 a",      729.0, 5010, 5010, 5179,  30),
+    13: ("700 c",      746.0, 5180, 5180, 5279, -31),
+    17: ("700 b",      734.0, 5730, 5730, 5849,  30),
+    20: ("800 DD",     791.0, 6150, 6150, 6449, -41),
+    25: ("1900+",     1930.0, 8040, 8040, 8689,  80),
+    26: ("850+",       859.0, 8690, 8690, 9039,  45),
+    28: ("700 APT",    758.0, 9210, 9210, 9659,  55),
+}
+
+def _in(a, ranges): return any(lo <= a <= hi for lo, hi in ranges)
+
+def gsm_band(a=None):
+    """Band-ID fuer die ARFCN: gewaehltes Band, wenn die ARFCN hineinpasst, sonst automatisch."""
+    a = int(C["GSM_ARFCN"] if a is None else a)
+    b = C.get("GSM_BAND", "")
+    if b in GSM_BANDS and _in(a, GSM_BANDS[b][2]): return b
+    for k in ("GSM900", "EGSM900", "DCS1800", "GSM850", "PCS1900"):
+        if _in(a, GSM_BANDS[k][2]): return k
+    return ""
+
 def arfcn_band(a):
-    a = int(a)
-    if 1 <= a <= 124:   return "GSM900"
-    if 512 <= a <= 885: return "DCS1800"
-    if 128 <= a <= 251: return "GSM850"
-    if 975 <= a <= 1023:return "EGSM900"
-    return "GSM900"
+    b = gsm_band(a)
+    return GSM_BANDS[b][1] if b else "GSM900"
 
-def arfcn_mhz(a):
-    a = int(a)
-    if 1 <= a <= 124:    return round(935 + 0.2 * a, 1)
-    if 512 <= a <= 885:  return round(1805.2 + 0.2 * (a - 512), 1)
-    if 128 <= a <= 251:  return round(869 + 0.2 * (a - 128), 1)
-    return 0.0
-
-def earfcn_mhz(e):
-    e = int(e)
-    # Band 3 (1800): DL 1805-1880, EARFCN 1200-1949
-    if 1200 <= e <= 1949: return round(1805.0 + 0.1 * (e - 1200), 1)
-    # Band 1 (2100): EARFCN 0-599
-    if 0 <= e <= 599:     return round(2110.0 + 0.1 * e, 1)
-    # Band 7 (2600): 2750-3449
-    if 2750 <= e <= 3449: return round(2620.0 + 0.1 * (e - 2750), 1)
-    # Band 20 (800): 6150-6449
-    if 6150 <= e <= 6449: return round(791.0 + 0.1 * (e - 6150), 1)
-    return 0.0
+def arfcn_mhz(a, ul=False):
+    a = int(a); b = gsm_band(a)
+    if not b: return 0.0
+    _l, _o, _r, dl, dup = GSM_BANDS[b]
+    return round(dl(a) - (dup if ul else 0), 1)
 
 def earfcn_band(e):
     e = int(e)
-    if 0 <= e <= 599:     return 1
-    if 1200 <= e <= 1949: return 3
-    if 2750 <= e <= 3449: return 7
-    if 6150 <= e <= 6449: return 20
-    return 3
+    for b, (_n, _f, _o, lo, hi, _d) in LTE_BANDS.items():
+        if lo <= e <= hi: return b
+    return 0
+
+def earfcn_mhz(e, ul=False):
+    b = earfcn_band(e)
+    if not b: return 0.0
+    _n, f, off, _lo, _hi, dup = LTE_BANDS[b]
+    return round(f + 0.1 * (int(e) - off) - (dup if ul else 0), 1)
+
+def band_tables():
+    """Fuer das Webinterface (eine Quelle fuer Daemon und Browser)."""
+    g = [{"id": k, "name": v[0], "osmo": v[1], "ranges": v[2], "dup": v[4],
+          "dl0": [round(v[3](lo), 1) for lo, _hi in v[2]]} for k, v in GSM_BANDS.items()]
+    l = [{"band": b, "name": v[0], "f": v[1], "off": v[2], "lo": v[3], "hi": v[4], "dup": v[5]}
+         for b, v in LTE_BANDS.items()]
+    return {"gsm": g, "lte": l}
 
 # ------------------------------------------------------------------ VTY-Hilfen (Osmocom)
 def vty(port, cmds, timeout=4):
@@ -368,10 +400,11 @@ def gsm_prepare():
         _vty_set(hlr, "hlr", "subscriber-create-on-demand", "subscriber-create-on-demand no-msisdn cs+ps")
     else:
         _vty_del(hlr, "subscriber-create-on-demand")
-    # RX-Gain (instance-Knoten der osmo-bts-trx.cfg)
+    # RX-Gain (instance-Knoten der osmo-bts-trx.cfg) + Band
     bts = os.path.join(WORKDIR, "osmo-bts-trx.cfg")
     if os.path.isfile(bts):
         bt = open(bts).read(); rg = int(C["GSM_RX_GAIN"])
+        bt = re.sub(r"(?m)^(\s*band\s+)\S+", r"\g<1>" + arfcn_band(arfcn), bt)
         if re.search(r"(?m)^\s*osmotrx rx-gain\b", bt):
             bt = re.sub(r"(?m)^(\s*osmotrx rx-gain\s+).*$", r"\g<1>%d" % rg, bt)
         else:
@@ -861,7 +894,7 @@ sib7 =
             thresh_x_high = 2;
             thresh_x_low = 2;
             start_arfcn = {arfcn};
-            band_ind = "dcs1800";
+            band_ind = "{'pcs1900' if gsm_band() == 'PCS1900' else 'dcs1800'}";
             explicit_list_of_arfcns = ( {arfcn} );
         }}
     );
@@ -942,6 +975,15 @@ def preflight(mode):
         return "Netzkennung pruefen: MCC 3 Ziffern, MNC 2-3 Ziffern"
     if mcc not in ("001", "999"):
         return "Nur Test-/Privatkennungen: MCC 001 (Test) oder 999 (privat)"
+    if mode in ("gsm", "csfb") and not gsm_band():
+        return f"GSM-ARFCN {C['GSM_ARFCN']} liegt in keinem Band - im Tab GSM Band und Kanal waehlen"
+    if mode in ("lte", "csfb"):
+        e = int(C["LTE_EARFCN"]); b = earfcn_band(e)
+        if not b: return f"EARFCN {e} liegt in keinem unterstuetzten LTE-Band - im Tab LTE waehlen"
+        half = int(NPRB_MHZ.get(int(C["LTE_NPRB"]), 5) * 5)        # halbe Bandbreite in 100-kHz-Schritten
+        lo, hi = LTE_BANDS[b][3], LTE_BANDS[b][4]
+        if e - half < lo or e + half > hi:
+            return f"EARFCN {e}: {NPRB_MHZ.get(int(C['LTE_NPRB']), 5):g} MHz passen nicht ins Band {b} ({lo + half}-{hi - half} moeglich)"
     g, l = lime_assign(mode)
     if mode == "csfb":
         if not FAKE and (not g or not l or g == l):
@@ -1178,15 +1220,16 @@ class Net:
                 "dev": {"gsm": lime_label(self.dev_gsm) if self.dev_gsm else "",
                         "lte": lime_label(self.dev_lte) if self.dev_lte else ""},
                 "gsm": {
-                    "arfcn": int(C["GSM_ARFCN"]), "band": arfcn_band(int(C["GSM_ARFCN"])),
-                    "mhz": arfcn_mhz(int(C["GSM_ARFCN"])),
+                    "arfcn": int(C["GSM_ARFCN"]), "band": GSM_BANDS.get(gsm_band(), ("?",))[0],
+                    "mhz": arfcn_mhz(int(C["GSM_ARFCN"])), "ul": arfcn_mhz(int(C["GSM_ARFCN"]), True),
                     "attached": sorted(msc_attached()) if self.state == "laeuft" else [],
                     "numbers": nums_load(),
                 },
                 "lte": {
                     "earfcn": int(C["LTE_EARFCN"]), "band": earfcn_band(int(C["LTE_EARFCN"])),
-                    "mhz": earfcn_mhz(int(C["LTE_EARFCN"])),
+                    "mhz": earfcn_mhz(int(C["LTE_EARFCN"])), "ul": earfcn_mhz(int(C["LTE_EARFCN"]), True),
                 },
+                "bands": band_tables(),
                 "sims": [{"imsi": i, "msisdn": s.get("msisdn", "")} for i, s in sorted(sims_load().items())],
                 "simfiles": sim_files(),
                 "tz": "UTC%+d:%02d%s" % (tz_now()[0], tz_now()[1], " +Sommerzeit" if tz_now()[2] else ""),
@@ -1223,7 +1266,10 @@ def handle_api(path, body):
         for k, v in req.items():
             if k in DEFAULTS or k in C:
                 v = str(v).replace('"', "").replace("\n", " ").strip()
-                if k in ("MCC", "MNC", "LTE_TAC"): v = re.sub(r"\D", "", v)
+                if k in ("MCC", "MNC", "LTE_TAC", "GSM_ARFCN", "LTE_EARFCN", "LTE_NPRB"):
+                    v = re.sub(r"\D", "", v)
+                    if not v and k not in ("MCC", "MNC"): continue     # leer -> alten Wert behalten
+                if k == "GSM_BAND" and v not in GSM_BANDS: v = ""
                 cset(k, v)
         NET.msg = "gespeichert - wirkt beim naechsten Start"
         if C.get("GSM_DEV") and C.get("GSM_DEV") == C.get("LTE_DEV"):
@@ -1404,15 +1450,16 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
   <div class=grid>
    <div class=card>
     <h2>GSM-Funk</h2>
+    <label>Band</label><select id=GSM_BAND onchange=gsmBand()></select>
     <div class=row style=align-items:end>
-     <div><label>ARFCN</label><input id=GSM_ARFCN oninput=updateFreq()></div>
+     <div><label>ARFCN</label><input id=GSM_ARFCN type=number inputmode=numeric oninput=updateFreq()></div>
      <div class=freqbox><div><div class=big id=gsm_mhz>–</div><div class=sm id=gsm_band></div></div></div>
     </div>
-    <div class=hint>1–124 = GSM900 · 512–885 = DCS1800</div>
+    <div class=hint id=gsm_range></div>
     <div class=row><div><label>TX-Gain</label><input id=GSM_TX_GAIN></div>
      <div><label>RX-Gain (0–50)</label><input id=GSM_RX_GAIN></div></div>
     <div class=hint>RX-Gain hoch = empfindlicherer Empfang (wichtig für EDGE-Uplink).</div>
-    <button class=btn onclick="save(['GSM_ARFCN','GSM_TX_GAIN','GSM_RX_GAIN'])">Speichern</button>
+    <button class=btn onclick="save(['GSM_BAND','GSM_ARFCN','GSM_TX_GAIN','GSM_RX_GAIN'])">Speichern</button>
    </div>
    <div class=card>
     <h2>GSM-Optionen</h2>
@@ -1451,11 +1498,13 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
   <div class=grid>
    <div class=card>
     <h2>LTE-Funk</h2>
+    <label>Band</label><select id=lte_bandsel onchange=lteBand()></select>
     <div class=row style=align-items:end>
-     <div><label>EARFCN</label><input id=LTE_EARFCN oninput=updateFreq()></div>
+     <div><label>EARFCN</label><input id=LTE_EARFCN type=number inputmode=numeric oninput=updateFreq()></div>
      <div class=freqbox><div><div class=big id=lte_mhz>–</div><div class=sm id=lte_band></div></div></div>
     </div>
-    <label>Bandbreite (PRB)</label><select id=LTE_NPRB>
+    <div class=hint id=lte_range></div>
+    <label>Bandbreite (PRB)</label><select id=LTE_NPRB onchange=updateFreq()>
      <option value=6>6 · 1.4 MHz</option><option value=15>15 · 3 MHz</option>
      <option value=25>25 · 5 MHz</option><option value=50>50 · 10 MHz</option>
      <option value=75>75 · 15 MHz</option><option value=100>100 · 20 MHz</option></select>
@@ -1550,11 +1599,36 @@ function simnr(){api('gsm_sim_nr',{imsi:$('gnum_imsi').value,msisdn:$('gnum_nr')
 function smstest(){api('sms_test',{imsi:$('sms_test_imsi').value,text:$('sms_test_text').value}).then(render);}
 function simdel(i){if(confirm('SIM '+i+' aus GSM und LTE löschen?'))api('sim_del',{imsi:i}).then(render);}
 function numdel(i){api('gsm_num_del',{imsi:i}).then(render);}
-function gsmInfo(a){a=+a||0;let m=0,b='';if(a>=1&&a<=124){m=935+0.2*a;b='GSM900';}else if(a>=512&&a<=885){m=1805.2+0.2*(a-512);b='DCS1800';}return{mhz:m?m.toFixed(1)+' MHz':'–',band:b};}
-function lteInfo(e){e=+e||0;let m=0,b=0;if(e>=0&&e<=599){m=2110+0.1*e;b=1;}else if(e>=1200&&e<=1949){m=1805+0.1*(e-1200);b=3;}else if(e>=2750&&e<=3449){m=2620+0.1*(e-2750);b=7;}else if(e>=6150&&e<=6449){m=791+0.1*(e-6150);b=20;}return{mhz:m?m.toFixed(1)+' MHz':'–',band:b?'Band '+b:''};}
-function updateFreq(){let g=gsmInfo($('GSM_ARFCN').value);$('gsm_mhz').textContent=g.mhz;$('gsm_band').textContent=g.band;let l=lteInfo($('LTE_EARFCN').value);$('lte_mhz').textContent=l.mhz;$('lte_band').textContent=l.band;}
+let BANDS=null;
+const NPRB_MHZ={6:1.4,15:3,25:5,50:10,75:15,100:20};
+function inR(a,r){return r.some(x=>a>=x[0]&&a<=x[1]);}
+function gsmBandOf(a){if(!BANDS)return null;const sel=$('GSM_BAND').value,L=BANDS.gsm;
+ let b=L.find(x=>x.id===sel&&inR(a,x.ranges));if(b)return b;
+ for(const id of ['GSM900','EGSM900','DCS1800','GSM850','PCS1900']){b=L.find(x=>x.id===id);if(b&&inR(a,b.ranges))return b;}return null;}
+function gsmDl(b,a){if(b.id==='GSM850')return 869.2+0.2*(a-128);if(b.id==='DCS1800')return 1805.2+0.2*(a-512);if(b.id==='PCS1900')return 1930.2+0.2*(a-512);return 935+0.2*(a<=124?a:a-1024);}
+function gsmInfo(a){a=parseInt(a);if(isNaN(a))return{mhz:'–',band:'keine gültige ARFCN',ok:false};const b=gsmBandOf(a);if(!b)return{mhz:'–',band:'keine gültige ARFCN',ok:false};
+ const dl=gsmDl(b,a);return{mhz:dl.toFixed(1)+' MHz',band:b.name+' · Uplink '+(dl-b.dup).toFixed(1)+' MHz',ok:true};}
+function lteBandOf(e){return BANDS?BANDS.lte.find(x=>e>=x.lo&&e<=x.hi):null;}
+function lteInfo(e){e=parseInt(e);const b=isNaN(e)?null:lteBandOf(e);if(!b)return{mhz:'–',band:'keine gültige EARFCN'};
+ const dl=b.f+0.1*(e-b.off);return{mhz:dl.toFixed(1)+' MHz',band:'Band '+b.band+' ('+b.name+') · Uplink '+(dl-b.dup).toFixed(1)+' MHz',b:b};}
+function fillBands(s){if(BANDS||!s.bands)return;BANDS=s.bands;
+ $('GSM_BAND').innerHTML='<option value="">automatisch (aus ARFCN)</option>'+BANDS.gsm.map(b=>'<option value="'+b.id+'">'+esc(b.name)+' · ARFCN '+b.ranges.map(r=>r[0]+'–'+r[1]).join(', ')+'</option>').join('');
+ $('lte_bandsel').innerHTML='<option value="">– Band wählen –</option>'+BANDS.lte.map(b=>'<option value="'+b.band+'">Band '+b.band+' · '+esc(b.name)+' MHz · '+b.f.toFixed(0)+'–'+(b.f+(b.hi-b.lo+1)/10).toFixed(0)+' MHz</option>').join('');}
+function gsmBand(){const b=BANDS&&BANDS.gsm.find(x=>x.id===$('GSM_BAND').value),a=parseInt($('GSM_ARFCN').value);
+ if(b&&!inR(a,b.ranges)){const r=b.ranges[b.ranges.length>1?1:0];$('GSM_ARFCN').value=Math.round((r[0]+r[1])/2);}updateFreq();}
+function lteBand(){const b=BANDS&&BANDS.lte.find(x=>String(x.band)===$('lte_bandsel').value);if(!b)return;
+ const e=parseInt($('LTE_EARFCN').value);if(!(e>=b.lo&&e<=b.hi))$('LTE_EARFCN').value=Math.round((b.lo+b.hi)/2);updateFreq(true);}
+function updateFreq(keepSel){let g=gsmInfo($('GSM_ARFCN').value);$('gsm_mhz').textContent=g.mhz;$('gsm_band').textContent=g.band;
+ const gb=BANDS&&BANDS.gsm.find(x=>x.id===$('GSM_BAND').value);
+ $('gsm_range').textContent=gb?('Gültige ARFCN im '+gb.name+': '+gb.ranges.map(r=>r[0]+'–'+r[1]).join(', ')):'Band „automatisch“: 1–124 GSM900, 975–1023 E-GSM, 128–251 GSM850, 512–885 DCS1800. PCS1900 nur über die Bandwahl.';
+ let l=lteInfo($('LTE_EARFCN').value);$('lte_mhz').textContent=l.mhz;$('lte_band').textContent=l.band;
+ if(l.b&&keepSel!==true)$('lte_bandsel').value=String(l.b.band);
+ const sb=BANDS&&BANDS.lte.find(x=>String(x.band)===$('lte_bandsel').value);
+ if(sb){const h=Math.round((NPRB_MHZ[$('LTE_NPRB').value]||5)*5),e=parseInt($('LTE_EARFCN').value),fit=e-h>=sb.lo&&e+h<=sb.hi;
+  $('lte_range').innerHTML='EARFCN im Band '+sb.band+': '+(sb.lo+h)+'–'+(sb.hi-h)+' (bei dieser Bandbreite)'+(fit?'':' · <b style=color:var(--err)>passt nicht ins Band</b>');}
+ else $('lte_range').textContent='';}
 function setv(id,v){let el=$(id);if(!el)return;if(el.type==='checkbox')el.checked=(v==='1'||v===true);else el.value=(v==null?'':v);}
-const FIELDS=['MCC','MNC','NETNAME','NETNAME_SHORT','SPN','NITZ','GSM_DEV','LTE_DEV','GSM_ARFCN','GSM_TX_GAIN','GSM_RX_GAIN','GSM_SIP_PEER','GSM_SIP_LOCAL','GSM_OPEN','GSM_DATA','GSM_SIP','GSM_SMS','GSM_SMS_FROM','GSM_SMS_EXTPREFIX','GSM_SMS_WELCOME','GSM_SMS_NUMBER','LTE_EARFCN','LTE_NPRB','LTE_TX_GAIN','LTE_RX_GAIN','LTE_APN'];
+const FIELDS=['MCC','MNC','NETNAME','NETNAME_SHORT','SPN','NITZ','GSM_DEV','LTE_DEV','GSM_BAND','GSM_ARFCN','GSM_TX_GAIN','GSM_RX_GAIN','GSM_SIP_PEER','GSM_SIP_LOCAL','GSM_OPEN','GSM_DATA','GSM_SIP','GSM_SMS','GSM_SMS_FROM','GSM_SMS_EXTPREFIX','GSM_SMS_WELCOME','GSM_SMS_NUMBER','LTE_EARFCN','LTE_NPRB','LTE_TX_GAIN','LTE_RX_GAIN','LTE_APN'];
 let filled=false,limeKey='';
 function limeOptions(s){
  const L=s.limes||[],c=s.conf||{},key=JSON.stringify(L)+(c.GSM_DEV||'')+(c.LTE_DEV||'');
@@ -1568,7 +1642,7 @@ function limeOptions(s){
 function reloadFields(){const c=S.conf||{};FIELDS.forEach(k=>{if(document.activeElement!==$(k))setv(k,c[k]);});filled=true;updateFreq();}
 function fmt(s){const m=Math.floor(s/60),h=Math.floor(m/60);return h?h+'h '+(m%60)+'m':(m?m+'m '+(s%60)+'s':s+'s');}
 function renderlog(){const f=($('logfilter').value||'').toLowerCase();let L=(S.log||[]);if(f)L=L.filter(x=>x.toLowerCase().includes(f));const lg=$('log');const near=lg.scrollTop+lg.clientHeight>=lg.scrollHeight-40;lg.textContent=L.join('\n');$('logcount').textContent=L.length+' Zeilen';if(near)lg.scrollTop=lg.scrollHeight;}
-function render(s){S=s;limeOptions(s);if(!filled)reloadFields();
+function render(s){S=s;fillBands(s);limeOptions(s);if(!filled)reloadFields();
  const run=s.state==='laeuft',t=s.tech;
  $('dot').className='dot '+(run?'on':(s.state==='fehler'?'err':''));
  $('state').textContent=s.state;$('msg').textContent=s.msg||'';
