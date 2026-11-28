@@ -39,17 +39,20 @@ DEFAULTS = {
     # 4G
     "LTE_EARFCN": "1575", "LTE_NPRB": "25", "LTE_TX_GAIN": "80", "LTE_RX_GAIN": "40",
     "LTE_APN": "internet", "LTE_TAC": "7",
+    "LTE_LOWCPU": "1",        # srsENB: 8-Bit-Turbodecoder, wenige Iterationen (schwache CPUs)
+    "CPU_PERF": "1",          # CPU-Takt waehrend des Betriebs auf "performance"
 }
 
 def load_conf():
     c = dict(DEFAULTS)
     try:
-        for line in open(CONF):
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            c[k.strip()] = v.strip().strip('"')
+        with open(CONF, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                c[k.strip()] = v.strip().strip('"')
     except Exception:
         pass
     return c
@@ -57,10 +60,12 @@ def load_conf():
 def save_conf(c):
     try:
         os.makedirs(os.path.dirname(CONF), exist_ok=True)
-        with open(CONF, "w") as f:
+        tmp = CONF + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write("# g90net - automatisch geschrieben\n")
             for k in sorted(c):
                 f.write('%s="%s"\n' % (k, c[k]))
+        os.replace(tmp, CONF)
     except Exception as e:
         log("conf speichern:", e)
 
@@ -77,7 +82,6 @@ def log(*a):
 FAKE = "--fake" in sys.argv   # Testmodus ohne echte Hardware/Prozesse
 
 # ------------------------------------------------------------------ Frequenzen (Anzeige)
-# GSM-Baender: id -> (Anzeige, Osmocom-Bandname, ARFCN-Bereiche, DL(MHz) bei ARFCN, Duplexabstand)
 GSM_BANDS = {
     "GSM850":  ("GSM 850",       "GSM850",  [(128, 251)],            lambda a: 869.2 + 0.2 * (a - 128), 45),
     "GSM900":  ("GSM 900 (P)",   "GSM900",  [(1, 124)],              lambda a: 935.0 + 0.2 * a, 45),
@@ -85,7 +89,6 @@ GSM_BANDS = {
     "DCS1800": ("DCS 1800",      "DCS1800", [(512, 885)],            lambda a: 1805.2 + 0.2 * (a - 512), 95),
     "PCS1900": ("PCS 1900",      "PCS1900", [(512, 810)],            lambda a: 1930.2 + 0.2 * (a - 512), 80),
 }
-# LTE-FDD-Baender (srsRAN 4G kann nur FDD): Band -> (Name, DL-Start MHz, N_Offs-DL, EARFCN von, bis, Duplex MHz)
 LTE_BANDS = {
     1:  ("2100",      2110.0,    0,    0,  599, 190),
     2:  ("1900 PCS",  1930.0,  600,  600, 1199,  80),
@@ -103,41 +106,54 @@ LTE_BANDS = {
     28: ("700 APT",    758.0, 9210, 9210, 9659,  55),
 }
 
-def _in(a, ranges): return any(lo <= a <= hi for lo, hi in ranges)
+def _in(a, ranges):
+    return any(lo <= a <= hi for lo, hi in ranges)
 
 def gsm_band(a=None):
-    """Band-ID fuer die ARFCN: gewaehltes Band, wenn die ARFCN hineinpasst, sonst automatisch."""
     a = int(C["GSM_ARFCN"] if a is None else a)
     b = C.get("GSM_BAND", "")
-    if b in GSM_BANDS and _in(a, GSM_BANDS[b][2]): return b
+    if b in GSM_BANDS and _in(a, GSM_BANDS[b][2]):
+        return b
     for k in ("GSM900", "EGSM900", "DCS1800", "GSM850", "PCS1900"):
-        if _in(a, GSM_BANDS[k][2]): return k
+        if _in(a, GSM_BANDS[k][2]):
+            return k
     return ""
+
+def sib7_band_ind(a=None):
+    b = gsm_band(a).upper()
+    if b in ("GSM900", "EGSM900", "GSM-900", "E-GSM-900"):
+        return "gsm900"
+    if b in ("PCS1900", "GSM1900", "PCS-1900"):
+        return "pcs1900"
+    return "dcs1800"
 
 def arfcn_band(a):
     b = gsm_band(a)
     return GSM_BANDS[b][1] if b else "GSM900"
 
 def arfcn_mhz(a, ul=False):
-    a = int(a); b = gsm_band(a)
-    if not b: return 0.0
+    a = int(a)
+    b = gsm_band(a)
+    if not b:
+        return 0.0
     _l, _o, _r, dl, dup = GSM_BANDS[b]
     return round(dl(a) - (dup if ul else 0), 1)
 
 def earfcn_band(e):
     e = int(e)
     for b, (_n, _f, _o, lo, hi, _d) in LTE_BANDS.items():
-        if lo <= e <= hi: return b
+        if lo <= e <= hi:
+            return b
     return 0
 
 def earfcn_mhz(e, ul=False):
     b = earfcn_band(e)
-    if not b: return 0.0
+    if not b:
+        return 0.0
     _n, f, off, _lo, _hi, dup = LTE_BANDS[b]
     return round(f + 0.1 * (int(e) - off) - (dup if ul else 0), 1)
 
 def band_tables():
-    """Fuer das Webinterface (eine Quelle fuer Daemon und Browser)."""
     g = [{"id": k, "name": v[0], "osmo": v[1], "ranges": v[2], "dup": v[4],
           "dl0": [round(v[3](lo), 1) for lo, _hi in v[2]]} for k, v in GSM_BANDS.items()]
     l = [{"band": b, "name": v[0], "f": v[1], "off": v[2], "lo": v[3], "hi": v[4], "dup": v[5]}
@@ -148,81 +164,122 @@ def band_tables():
 def vty(port, cmds, timeout=4):
     out = []
     try:
-        s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
-        s.settimeout(timeout)
-        time.sleep(0.2)
-        try: out.append(s.recv(4096).decode(errors="replace"))
-        except Exception: pass
-        for cmd in cmds:
-            s.sendall((cmd + "\r\n").encode()); time.sleep(0.3)
-            try: out.append(s.recv(8192).decode(errors="replace"))
-            except Exception: pass
-        s.close()
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            time.sleep(0.2)
+            try:
+                out.append(s.recv(4096).decode(errors="replace"))
+            except Exception:
+                pass
+            for cmd in cmds:
+                s.sendall((cmd + "\r\n").encode())
+                time.sleep(0.3)
+                try:
+                    out.append(s.recv(8192).decode(errors="replace"))
+                except Exception:
+                    pass
     except Exception as e:
         return "VTY-Fehler: %s" % e
     return "".join(out)
 
+def vty_ok(resp, allow_exists=False):
+    text = (resp or "").strip()
+    if not text or text.startswith("VTY-Fehler"):
+        return False, text or "Leere VTY-Antwort"
+    check = text.replace("% Subscriber already exists", "") if allow_exists else text
+    if any(tok in check for tok in ("% ", "Unknown command", "Command doesn't match")):
+        return False, check.strip()[-180:]
+    return True, ""
+
 HLR_VTY = 4258
-MSC_VTY = 4254   # osmo-msc Telnet-VTY: SMS senden + eingebuchte Teilnehmer abfragen
+MSC_VTY = 4254
 
 def _sub(path, pairs):
-    if not os.path.isfile(path): return
-    t = open(path).read()
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8", errors="replace") as f:
+        t = f.read()
     for pat, rep in pairs:
         t = re.sub(pat, rep, t, flags=re.MULTILINE)
-    open(path, "w").write(t)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(t)
 
 def _vty_set(path, node, key, full):
-    if not os.path.isfile(path): return
-    t = open(path).read()
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8", errors="replace") as f:
+        t = f.read()
     if re.search(rf"(?m)^\s*{key}(\s|$)", t):
         t = re.sub(rf"(?m)^\s*{key}.*$", " " + full, t)
     else:
         t = re.sub(rf"(?m)^({re.escape(node)}\s*)$", r"\1\n " + full, t, count=1)
-    open(path, "w").write(t)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(t)
 
 def _vty_del(path, key):
-    if not os.path.isfile(path): return
-    t = open(path).read()
-    open(path, "w").write(re.sub(rf"(?m)^\s*{key}.*\n?", "", t))
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8", errors="replace") as f:
+        t = f.read()
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(re.sub(rf"(?m)^\s*{key}.*\n?", "", t))
+
+def _strip_sgs_block(cfg_text):
+    lines = cfg_text.splitlines()
+    out = []
+    skip = False
+    for line in lines:
+        s = line.strip()
+        if not skip and s == "sgs":
+            skip = True
+            continue
+        if skip:
+            if s and not line.startswith((" ", "\t")):
+                skip = False
+                out.append(line)
+            continue
+        out.append(line)
+    return "\n".join(out)
 
 # ================================================================== LimeSDR frei machen
 def _lime_service(action):
-    if FAKE: return
+    if FAKE:
+        return
     for svc in ("g90-lime", "g90lime"):
         try:
             subprocess.run(["systemctl", action, svc + ".service"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-        except Exception: pass
+        except Exception:
+            pass
 
 def _free_lime():
-    """Alles beenden, was den LimeSDR offen haelt. Die USB-Platine (FX3) NICHT hart
-    reseten (faellt sonst vom Bus); bei der Mini (FT601) hilft ein USB-Reset."""
-    if FAKE: return
+    if FAKE:
+        return
     import fcntl
     for vid, pid, hard in (("0403", "601f", True), ("1d50", "6108", False)):
         try:
             out = subprocess.run(["lsusb", "-d", f"{vid}:{pid}"],
                                  capture_output=True, text=True, timeout=5).stdout
             m = re.search(r"Bus (\d+) Device (\d+)", out)
-            if not m: continue
+            if not m:
+                continue
             path = f"/dev/bus/usb/{m.group(1)}/{m.group(2)}"
             try:
                 subprocess.run(["fuser", "-k", path], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=5); time.sleep(1.0)
-            except Exception: pass
+                               stderr=subprocess.DEVNULL, timeout=5)
+                time.sleep(1.0)
+            except Exception:
+                pass
             if hard:
-                with open(path, "wb") as f: fcntl.ioctl(f, 0x5514, 0)
+                with open(path, "wb") as f:
+                    fcntl.ioctl(f, 0x5514, 0)
         except Exception as e:
             log("lime frei:", e)
 
 # ================================================================== LimeSDR-Auswahl
-# Je Netz ein eigener LimeSDR (z.B. LimeSDR Mini fuer GSM, LimeSDR USB fuer LTE).
-# Zuordnung ueber die Seriennummer (GSM_DEV / LTE_DEV), leer = automatisch.
-LIMES = []          # zuletzt gefundene Geraete [{serial, name, media, ...}]
+LIMES = []
 
 def lime_scan():
-    """Angeschlossene LimeSDR finden (LimeUtil, sonst SoapySDRUtil)."""
     global LIMES
     if FAKE:
         LIMES = [{"serial": "1D3AC4F1A2B3C4", "name": "LimeSDR Mini", "media": "USB 3.0"},
@@ -236,8 +293,10 @@ def lime_scan():
             d = {"name": parts[0]}
             for p in parts[1:]:
                 if "=" in p:
-                    k, v = p.split("=", 1); d[k.strip()] = v.strip()
-            if d.get("serial"): devs.append(d)
+                    k, v = p.split("=", 1)
+                    d[k.strip()] = v.strip()
+            if d.get("serial"):
+                devs.append(d)
     except Exception as e:
         log("LimeUtil:", e)
     if not devs:
@@ -257,16 +316,19 @@ def lime_scan():
     return LIMES
 
 def lime_assign(mode):
-    """(gsm_serial, lte_serial) fuer den Modus. Leere Wahl = erstes Geraet, das
-    nicht schon dem anderen Netz gehoert."""
     devs = LIMES or lime_scan()
     serials = [d["serial"] for d in devs]
-    g = C.get("GSM_DEV", "").strip(); l = C.get("LTE_DEV", "").strip()
+    g = C.get("GSM_DEV", "").strip()
+    l = C.get("LTE_DEV", "").strip()
     first = lambda other: next((s for s in serials if s != other), "")
-    if mode in ("gsm", "csfb") and not g: g = first(l)
-    if mode in ("lte", "csfb") and not l: l = first(g)
-    if mode == "gsm": l = ""
-    if mode == "lte": g = ""
+    if mode in ("gsm", "csfb") and not g:
+        g = first(l)
+    if mode in ("lte", "csfb") and not l:
+        l = first(g)
+    if mode == "gsm":
+        l = ""
+    if mode == "lte":
+        g = ""
     return g, l
 
 def lime_label(serial):
@@ -278,7 +340,6 @@ def lime_label(serial):
 # ================================================================== Osmocom-Faehigkeiten
 _VTYREF = {}
 def osmo_has(binary, word):
-    """True/False, ob ein Osmocom-Programm einen VTY-Befehl kennt; None = unbekannt."""
     if binary not in _VTYREF:
         try:
             _VTYREF[binary] = subprocess.run([binary, "--vty-ref-xml"], capture_output=True,
@@ -286,15 +347,16 @@ def osmo_has(binary, word):
         except Exception:
             _VTYREF[binary] = ""
     ref = _VTYREF[binary]
-    if "<vtydoc" not in ref: return None
+    if "<vtydoc" not in ref:
+        return None
     return re.search(r'id=["\']%s\b' % re.escape(word), ref) is not None
 
 def tz_now():
-    """Zeitzone fuer NITZ: (Stunden, Minuten, Sommerzeit 0/1) ohne DST-Anteil."""
     lt = time.localtime()
     dst = 1 if lt.tm_isdst > 0 else 0
     off = lt.tm_gmtoff // 60 - dst * 60
-    h = int(off / 60); m = abs(off) % 60
+    h = int(off / 60)
+    m = abs(off) % 60
     return h, min((0, 15, 30, 45), key=lambda x: abs(x - m)), dst
 
 # ================================================================== GSM (Osmocom)
@@ -320,8 +382,10 @@ OSMO_SERVICES = ["osmo-stp", "osmo-hlr", "osmo-mgw", "osmo-msc", "osmo-bsc",
 
 def gsm_components():
     comps = list(GSM_CORE)
-    if C["GSM_DATA"] == "1": comps += GSM_DATA
-    if C["GSM_SIP"] == "1" and C["GSM_SIP_PEER"]: comps += [GSM_SIP]
+    if C["GSM_DATA"] == "1":
+        comps += GSM_DATA
+    if C["GSM_SIP"] == "1" and C["GSM_SIP_PEER"]:
+        comps += [GSM_SIP]
     return comps
 
 def _tailscale_ip():
@@ -329,8 +393,10 @@ def _tailscale_ip():
         out = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=5).stdout
         for line in out.splitlines():
             ip = line.strip()
-            if re.match(r"100\.\d+\.\d+\.\d+$", ip): return ip
-    except Exception: pass
+            if re.match(r"100\.\d+\.\d+\.\d+$", ip):
+                return ip
+    except Exception:
+        pass
     return "0.0.0.0"
 
 def _gprs_block(m):
@@ -344,9 +410,11 @@ def _gprs_block(m):
 def gsm_prepare():
     for _n, _b, cfg in gsm_components():
         src = os.path.join(OSMO_CFG, cfg)
-        if os.path.isfile(src): shutil.copy(src, os.path.join(WORKDIR, cfg))
+        if os.path.isfile(src):
+            shutil.copy(src, os.path.join(WORKDIR, cfg))
     arfcn, mcc, mnc = int(C["GSM_ARFCN"]), C["MCC"], C["MNC"]
-    data_on = C["GSM_DATA"] == "1"; open_reg = C["GSM_OPEN"] == "1"
+    data_on = C["GSM_DATA"] == "1"
+    open_reg = C["GSM_OPEN"] == "1"
     bsc = os.path.join(WORKDIR, "osmo-bsc.cfg")
     rules = [
         (r"^(\s*network country code\s+)\d+", r"\g<1>" + mcc),
@@ -358,22 +426,24 @@ def gsm_prepare():
     if not data_on:
         rules.append((r"^(\s*gprs mode\s+)\S+", r"\g<1>none"))
     _sub(bsc, rules)
-    if data_on:
-        t = open(bsc).read()
+    if data_on and os.path.isfile(bsc):
+        with open(bsc, encoding="utf-8", errors="replace") as f:
+            t = f.read()
         t = re.sub(r"(?m)^\s*gprs (routing area|network-control-order|cell|nsei|nsvc)\b.*\n?", "", t)
         t = re.sub(r"(?m)^(\s*)gprs mode\s+\S+.*$", _gprs_block, t, count=1)
         for ts in ("5", "6", "7"):
             t = re.sub(rf"(?m)(^\s*timeslot {ts}\s*\n\s*phys_chan_config\s+)TCH/F\s*$", r"\g<1>TCH/F_PDCH", t)
-        open(bsc, "w").write(t)
-    # MSC: Kennung + Name
-    _sub(os.path.join(WORKDIR, "osmo-msc.cfg"), [
+        with open(bsc, "w", encoding="utf-8") as f:
+            f.write(t)
+
+    msc = os.path.join(WORKDIR, "osmo-msc.cfg")
+    hlr = os.path.join(WORKDIR, "osmo-hlr.cfg")
+    _sub(msc, [
         (r"^(\s*network country code\s+)\d+", r"\g<1>" + mcc),
         (r"^(\s*mobile network code\s+)\d+", r"\g<1>" + mnc),
     ])
-    msc = os.path.join(WORKDIR, "osmo-msc.cfg"); hlr = os.path.join(WORKDIR, "osmo-hlr.cfg")
     _vty_del(msc, "authentication")
-    # Netzname + NITZ: MM-Information mit Name, Uhrzeit und Zeitzone ans Handy
-    word = lambda s: re.sub(r"[^\w.+-]", "-", s or "pKOM")      # VTY: ein Wort
+    word = lambda s: re.sub(r"[^\w.+-]", "-", s or "pKOM")
     _vty_set(msc, "network", "short name", "short name " + word(C.get("NETNAME_SHORT") or C["NETNAME"]))
     _vty_set(msc, "network", "long name", "long name " + word(C["NETNAME"]))
     if C.get("NITZ", "1") == "1":
@@ -383,60 +453,69 @@ def gsm_prepare():
     else:
         _vty_set(msc, "network", "mm info", "mm info 0")
         _vty_del(msc, "timezone")
-    # SGs zur Open5GS-MME (nur im Modus LTE + GSM)
-    t = open(msc).read()
-    t = re.sub(r"(?m)^sgs[ \t]*\n(?:[ \t]+.*(?:\n|$))*", "", t)
-    if NET.tech == "csfb":
-        t = t.rstrip("\n") + "\nsgs\n local-port %d\n local-ip 127.0.0.1\n vlr-name vlr.pkom.test\n" % SGS_PORT
-    open(msc, "w").write(t)
-    # eigener LimeSDR fuer GSM (osmo-trx-lms waehlt per Teilstring der Geraeteliste)
+
+    if os.path.isfile(msc):
+        with open(msc, encoding="utf-8", errors="replace") as f:
+            t = _strip_sgs_block(f.read())
+        if NET.tech == "csfb":
+            t = t.rstrip("\n") + f"\nsgs\n local-port {SGS_PORT}\n local-ip 127.0.0.1\n vlr-name vlr.pkom.test\n"
+        with open(msc, "w", encoding="utf-8") as f:
+            f.write(t if t.endswith("\n") else t + "\n")
+
     trx = os.path.join(WORKDIR, "osmo-trx-lms.cfg")
     if os.path.isfile(trx):
         if NET.dev_gsm:
             _vty_set(trx, "trx", "dev-args", "dev-args serial=" + NET.dev_gsm)
         else:
             _vty_del(trx, "dev-args")
+
     if open_reg:
         _vty_set(hlr, "hlr", "subscriber-create-on-demand", "subscriber-create-on-demand no-msisdn cs+ps")
     else:
         _vty_del(hlr, "subscriber-create-on-demand")
-    # RX-Gain (instance-Knoten der osmo-bts-trx.cfg) + Band
+
     bts = os.path.join(WORKDIR, "osmo-bts-trx.cfg")
     if os.path.isfile(bts):
-        bt = open(bts).read(); rg = int(C["GSM_RX_GAIN"])
+        with open(bts, encoding="utf-8", errors="replace") as f:
+            bt = f.read()
+        rg = int(C["GSM_RX_GAIN"])
         bt = re.sub(r"(?m)^(\s*band\s+)\S+", r"\g<1>" + arfcn_band(arfcn), bt)
         if re.search(r"(?m)^\s*osmotrx rx-gain\b", bt):
             bt = re.sub(r"(?m)^(\s*osmotrx rx-gain\s+).*$", r"\g<1>%d" % rg, bt)
         else:
             bt = re.sub(r"(?m)^(\s*instance 0\s*)$", r"\1\n  osmotrx rx-gain %d" % rg, bt, count=1)
-        open(bts, "w").write(bt)
-    # SIP-Trunk
+        with open(bts, "w", encoding="utf-8") as f:
+            f.write(bt)
+
     if C["GSM_SIP"] == "1" and C["GSM_SIP_PEER"]:
         _vty_set(msc, "msc", "mncc", "mncc external /tmp/mncc.sock")
         local = C.get("GSM_SIP_LOCAL") or _tailscale_ip()
-        with open(os.path.join(WORKDIR, "osmo-sip-connector.cfg"), "w") as f:
+        with open(os.path.join(WORKDIR, "osmo-sip-connector.cfg"), "w", encoding="utf-8") as f:
             f.write("mncc\n socket-path /tmp/mncc.sock\nsip\n local %s 5060\n remote %s 5060\n"
                     % (local, C["GSM_SIP_PEER"]))
     else:
         _vty_set(msc, "msc", "mncc", "mncc internal")
+
     if data_on and open_reg:
         _vty_set(os.path.join(WORKDIR, "osmo-sgsn.cfg"), "sgsn", "auth-policy", "auth-policy accept-all")
 
-# ---- SIMs: EINE Liste fuer beide Netze
-# Eingetragen wird nur hier; pKOM schreibt jede SIM automatisch ins osmo-hlr (GSM)
-# und in den Open5GS-HSS (LTE, MongoDB). Ki/OPc verlassen den Rechner nie
-# (die Weboberflaeche bekommt nur IMSI + Rufnummer zurueck).
+# ---- SIMs
 SIMS_FILE = os.path.join(WORKDIR, "sims.json")
 
 def sims_load():
-    try: return json.load(open(SIMS_FILE))
-    except Exception: return {}
+    try:
+        with open(SIMS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 def sims_save(d):
     try:
         tmp = SIMS_FILE + ".tmp"
-        with open(tmp, "w") as f: json.dump(d, f, indent=1)
-        os.chmod(tmp, 0o600); os.replace(tmp, SIMS_FILE)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=1)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, SIMS_FILE)
     except Exception as e:
         log("sims:", e)
 
@@ -450,23 +529,29 @@ def _hex32(x):
     return re.sub(r"[^0-9a-fA-F]", "", x or "").upper()
 
 def hlr_put(imsi, s):
-    if FAKE: return None
-    r = vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} create",
-                      f"subscriber imsi {imsi} update msisdn {s.get('msisdn') or imsi[-8:]}",
-                      f"subscriber imsi {imsi} update aud3g milenage k {s['ki']} opc {s['opc']}"])
-    return None if "% " not in r.replace("% Subscriber already exists", "") else r.strip()[-160:]
+    if FAKE:
+        return None
+    msisdn = s.get("msisdn") or imsi[-8:]
+    r = vty(HLR_VTY, [
+        "enable",
+        f"subscriber imsi {imsi} create",
+        f"subscriber imsi {imsi} update msisdn {msisdn}",
+        f"subscriber imsi {imsi} update aud3g milenage k {s['ki']} opc {s['opc']}",
+    ])
+    ok, err = vty_ok(r, allow_exists=True)
+    return None if ok else err
 
 def _hss():
     import pymongo
     return pymongo.MongoClient("mongodb://127.0.0.1/", serverSelectionTimeoutMS=3000)["open5gs"]["subscribers"]
 
 def hss_put(imsi, s):
-    """SIM in den Open5GS-HSS schreiben (anlegen oder aktualisieren, SQN bleibt)."""
-    if FAKE: return None
+    if FAKE:
+        return None
     try:
         from bson.int64 import Int64
-        ambr = {"downlink": {"value": 1, "unit": 3}, "uplink": {"value": 1, "unit": 3}}   # 1 Gbit/s
-        sess = {"name": C.get("LTE_APN") or "internet", "type": 3,          # 3 = IPv4v6
+        ambr = {"downlink": {"value": 1, "unit": 3}, "uplink": {"value": 1, "unit": 3}}
+        sess = {"name": C.get("LTE_APN") or "internet", "type": 3,
                 "qos": {"index": 9, "arp": {"priority_level": 8, "pre_emption_capability": 1,
                                             "pre_emption_vulnerability": 1}},
                 "ambr": ambr, "pcc_rule": []}
@@ -477,7 +562,7 @@ def hss_put(imsi, s):
                      "slice": [{"sst": 1, "default_indicator": True, "session": [sess]}],
                      "access_restriction_data": 32, "subscriber_status": 0,
                      "operator_determined_barring": 0,
-                     "network_access_mode": 0,        # 0 = Paket + Leitung -> kombinierter Attach (CSFB)
+                     "network_access_mode": 0,
                      "subscribed_rau_tau_timer": 12},
             "$setOnInsert": {"security.sqn": Int64(97), "imeisv": [], "mme_host": [],
                              "mme_realm": [], "purge_flag": [], "__v": 0}}, upsert=True)
@@ -488,135 +573,188 @@ def hss_put(imsi, s):
         return "HSS/MongoDB: %s" % str(e)[:120]
 
 def hss_del(imsi):
-    if FAKE: return
-    try: _hss().delete_one({"imsi": imsi})
-    except Exception as e: log("hss loeschen:", e)
+    if FAKE:
+        return
+    try:
+        _hss().delete_one({"imsi": imsi})
+    except Exception as e:
+        log("hss loeschen:", e)
 
 def hss_sync_all():
     errs = [e for e in (hss_put(i, s) for i, s in sims_load().items()) if e]
     return errs[0] if errs else None
 
 def sim_add(imsi, ki, opc, msisdn):
-    imsi = re.sub(r"\D", "", imsi or ""); ki = _hex32(ki); opc = _hex32(opc)
+    imsi = re.sub(r"\D", "", imsi or "")
+    ki = _hex32(ki)
+    opc = _hex32(opc)
     if len(imsi) < 14 or len(ki) != 32 or len(opc) != 32:
         return "IMSI (15 Ziffern), Ki und OPc (je 32 Hex) pruefen"
     msisdn = re.sub(r"\D", "", msisdn or "") or nums_load().get(imsi) or imsi[-8:]
-    d = sims_load(); d[imsi] = {"ki": ki, "opc": opc, "msisdn": msisdn}; sims_save(d)
-    n = nums_load(); n[imsi] = msisdn; nums_save(n)          # Rufnummer dauerhaft
+    d = sims_load()
+    d[imsi] = {"ki": ki, "opc": opc, "msisdn": msisdn}
+    sims_save(d)
+    n = nums_load()
+    n[imsi] = msisdn
+    nums_save(n)
     errs = []
     e = hss_put(imsi, d[imsi])
-    if e: errs.append(e)
+    if e:
+        errs.append(e)
     if gsm_on() and not FAKE:
         e = hlr_put(imsi, d[imsi])
-        if e: errs.append("HLR: " + e)
-        else: sms_send(imsi, _sms_text(C.get("GSM_SMS_NUMBER", ""), nummer=msisdn))
+        if e:
+            errs.append("HLR: " + e)
+        else:
+            sms_send(imsi, _sms_text(C.get("GSM_SMS_NUMBER", ""), nummer=msisdn))
     return ("SIM gespeichert, aber: " + "; ".join(errs)) if errs else None
 
 def sim_del(imsi):
     imsi = re.sub(r"\D", "", imsi or "")
     d = sims_load()
     if imsi in d:
-        del d[imsi]; sims_save(d)
+        del d[imsi]
+        sims_save(d)
     hss_del(imsi)
     if gsm_on() and not FAKE:
-        vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} delete"])
+        r = vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} delete"])
+        ok, err = vty_ok(r)
+        if not ok:
+            log("hlr delete:", imsi, err)
 
 def _migrate_lte_db():
-    """Alte srsEPC-Liste (user_db.csv) einmalig in die gemeinsame SIM-Liste uebernehmen."""
     udb = os.path.join(WORKDIR, "user_db.csv")
-    if not os.path.isfile(udb): return
-    d = sims_load(); nums = nums_load(); n = 0
-    for l in open(udb).read().splitlines():
-        f = l.split(",")
-        if len(f) >= 5 and not l.startswith("#") and f[0] not in d and len(_hex32(f[3])) == 32:
-            d[f[0]] = {"ki": _hex32(f[3]), "opc": _hex32(f[4]), "msisdn": nums.get(f[0], "")}; n += 1
-    if n: sims_save(d)
-    try: os.replace(udb, udb + ".alt")
-    except Exception: pass
+    if not os.path.isfile(udb):
+        return
+    d = sims_load()
+    nums = nums_load()
+    n = 0
+    with open(udb, encoding="utf-8", errors="replace") as f:
+        for l in f:
+            l = l.rstrip("\r\n")
+            parts = l.split(",")
+            if len(parts) >= 5 and not l.startswith("#") and parts[0] not in d and len(_hex32(parts[3])) == 32:
+                d[parts[0]] = {"ki": _hex32(parts[3]), "opc": _hex32(parts[4]), "msisdn": nums.get(parts[0], "")}
+                n += 1
+    if n:
+        sims_save(d)
+    try:
+        os.replace(udb, udb + ".alt")
+    except Exception:
+        pass
     log(f"{n} SIM(s) aus der alten srsEPC-Liste uebernommen")
 
-# Dauerhafte IMSI->Rufnummer-Zuweisungen (ueberleben Neustarts, werden bei jedem
-# GSM-Start erneut ins HLR geschrieben - auch fuer offen angemeldete SIMs ohne Ki).
 NUMS_FILE = os.path.join(WORKDIR, "numbers.json")
 
 def nums_load():
-    try: return json.load(open(NUMS_FILE))
-    except Exception: return {}
+    try:
+        with open(NUMS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 def nums_save(d):
-    try: json.dump(d, open(NUMS_FILE, "w"))
-    except Exception as e: log("numbers:", e)
+    try:
+        tmp = NUMS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        os.replace(tmp, NUMS_FILE)
+    except Exception as e:
+        log("numbers:", e)
 
 def gsm_apply_numbers():
-    """Beim GSM-Start: alle SIMs (mit Schluessel) + Rufnummern ins HLR schreiben."""
-    if FAKE: return
+    if FAKE:
+        return
     for imsi, s in sims_load().items():
         e = hlr_put(imsi, s)
-        if e: log("hlr:", imsi, e)
+        if e:
+            log("hlr:", imsi, e)
     d = nums_load()
-    if not d: return
-    cmds = ["enable"]
+    if not d:
+        return
     for imsi, msisdn in d.items():
-        cmds += [f"subscriber imsi {imsi} create", f"subscriber imsi {imsi} update msisdn {msisdn}"]
-    vty(HLR_VTY, cmds)
+        r = vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} create", f"subscriber imsi {imsi} update msisdn {msisdn}"])
+        ok, err = vty_ok(r, allow_exists=True)
+        if not ok:
+            log("hlr nr:", imsi, err)
 
 def gsm_sim_nr(imsi, msisdn):
-    imsi = re.sub(r"\D", "", imsi); msisdn = re.sub(r"\D", "", msisdn)
-    if len(imsi) < 14 or not msisdn: return "IMSI (15 Ziffern) und Rufnummer pruefen"
-    d = nums_load(); d[imsi] = msisdn; nums_save(d)        # dauerhaft merken
+    imsi = re.sub(r"\D", "", imsi or "")
+    msisdn = re.sub(r"\D", "", msisdn or "")
+    if len(imsi) < 14 or not msisdn:
+        return "IMSI (15 Ziffern) und Rufnummer pruefen"
+    d = nums_load()
+    d[imsi] = msisdn
+    nums_save(d)
     s = sims_load()
-    if imsi in s:                                           # SIM mit Schluessel: auch im HSS
-        s[imsi]["msisdn"] = msisdn; sims_save(s); hss_put(imsi, s[imsi])
-    if not FAKE and gsm_on():                               # sofort anwenden, wenn GSM laeuft
-        vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} create",
-                      f"subscriber imsi {imsi} update msisdn {msisdn}"])
+    if imsi in s:
+        s[imsi]["msisdn"] = msisdn
+        sims_save(s)
+        hss_put(imsi, s[imsi])
+    if not FAKE and gsm_on():
+        r = vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} create", f"subscriber imsi {imsi} update msisdn {msisdn}"])
+        ok, err = vty_ok(r, allow_exists=True)
+        if not ok:
+            return "HLR: " + err
         sms_send(imsi, _sms_text(C.get("GSM_SMS_NUMBER", ""), nummer=msisdn))
     return None
 
 def gsm_num_del(imsi):
-    imsi = re.sub(r"\D", "", imsi); d = nums_load()
+    imsi = re.sub(r"\D", "", imsi or "")
+    d = nums_load()
     if imsi in d:
-        del d[imsi]; nums_save(d)
+        del d[imsi]
+        nums_save(d)
     if not FAKE and gsm_on():
-        vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} update msisdn "])
+        r = vty(HLR_VTY, ["enable", f"subscriber imsi {imsi} update msisdn"])
+        ok, err = vty_ok(r)
+        if not ok:
+            log("hlr nr loeschen:", imsi, err)
 
-# ---- SIM-Daten erzeugen (fuer eigene eSIM-Profile, z.B. simlessly)
-# IMSI = eigene Kennung (MCC+MNC) + zufaellige MSIN, Ki/OP zufaellig (secrets),
-# OPc = AES_Ki(OP) xor OP (Milenage, TS 35.206), ICCID mit Luhn-Pruefziffer.
+# ---- SIM-Daten erzeugen
 _SBOX = []
 def _aes_tables():
-    if _SBOX: return
-    p = q = 1; sb = [0] * 256
-    while True:                                    # S-Box ueber das Inverse in GF(2^8)
+    if _SBOX:
+        return
+    p = q = 1
+    sb = [0] * 256
+    while True:
         p = p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)
         q ^= q << 1; q ^= q << 2; q ^= q << 4; q &= 0xFF
-        if q & 0x80: q ^= 0x09
+        if q & 0x80:
+            q ^= 0x09
         x = q ^ ((q << 1 | q >> 7) & 0xFF) ^ ((q << 2 | q >> 6) & 0xFF) \
               ^ ((q << 3 | q >> 5) & 0xFF) ^ ((q << 4 | q >> 4) & 0xFF)
         sb[p] = x ^ 0x63
-        if p == 1: break
+        if p == 1:
+            break
     sb[0] = 0x63
     _SBOX.extend(sb)
 
-def _xt(a): return ((a << 1) ^ 0x1B) & 0xFF if a & 0x80 else a << 1
+def _xt(a):
+    return ((a << 1) ^ 0x1B) & 0xFF if a & 0x80 else a << 1
 
 def aes128_encrypt(key, block):
-    """AES-128, ein Block (reines Python, nur fuer die OPc-Berechnung)."""
-    _aes_tables(); S = _SBOX
-    w = [list(key[i:i + 4]) for i in range(0, 16, 4)]; rc = 1
+    _aes_tables()
+    S = _SBOX
+    w = [list(key[i:i + 4]) for i in range(0, 16, 4)]
+    rc = 1
     for i in range(4, 44):
         t = list(w[i - 1])
         if i % 4 == 0:
-            t = [S[b] for b in t[1:] + t[:1]]; t[0] ^= rc; rc = _xt(rc)
+            t = [S[b] for b in t[1:] + t[:1]]
+            t[0] ^= rc
+            rc = _xt(rc)
         w.append([a ^ b for a, b in zip(w[i - 4], t)])
     s = [b ^ k for b, k in zip(block, sum(w[0:4], []))]
     for r in range(1, 11):
         s = [S[b] for b in s]
-        s = [s[((c + i) % 4) * 4 + i] for c in range(4) for i in range(4)]     # ShiftRows
+        s = [s[((c + i) % 4) * 4 + i] for c in range(4) for i in range(4)]
         if r < 10:
             m = []
             for c in range(4):
-                a = s[c * 4:c * 4 + 4]; t = a[0] ^ a[1] ^ a[2] ^ a[3]
+                a = s[c * 4:c * 4 + 4]
+                t = a[0] ^ a[1] ^ a[2] ^ a[3]
                 m += [a[i] ^ t ^ _xt(a[i] ^ a[(i + 1) % 4]) for i in range(4)]
             s = m
         s = [b ^ k for b, k in zip(s, sum(w[r * 4:r * 4 + 4], []))]
@@ -632,7 +770,8 @@ def luhn(digits):
         d = int(ch)
         if i % 2 == 0:
             d *= 2
-            if d > 9: d -= 9
+            if d > 9:
+                d -= 9
         tot += d
     return str((10 - tot % 10) % 10)
 
@@ -649,15 +788,21 @@ def sim_generate(count=1, msisdn_start="", iccid_prefix=""):
     pref = pref[:16]
     out = []
     while len(out) < count:
-        imsi = mcc + mnc + _rand_digits(15 - len(mcc) - len(mnc))
-        if imsi in used: continue
+        imsi = mcc + mnc + _rand_digits(max(1, 15 - len(mcc) - len(mnc)))
+        if imsi in used:
+            continue
         used.add(imsi)
-        ki = secrets.token_hex(16).upper(); op = secrets.token_hex(16).upper()
-        body = pref + _rand_digits(18 - len(pref))
+        ki = secrets.token_hex(16).upper()
+        op = secrets.token_hex(16).upper()
+        body = pref + _rand_digits(max(0, 18 - len(pref)))
+        body = body[:18]
         msisdn = ""
         if nr:
-            while str(nr) in taken_nr: nr += 1
-            msisdn = str(nr); taken_nr.add(msisdn); nr += 1
+            while str(nr) in taken_nr:
+                nr += 1
+            msisdn = str(nr)
+            taken_nr.add(msisdn)
+            nr += 1
         out.append({"iccid": body + luhn(body), "imsi": imsi, "ki": ki, "op": op,
                     "opc": milenage_opc(ki, op), "amf": "8000", "sqn": "000000000020",
                     "msisdn": msisdn, "pin1": "0000", "puk1": _rand_digits(8),
@@ -666,8 +811,6 @@ def sim_generate(count=1, msisdn_start="", iccid_prefix=""):
     return out
 
 # ---- SIM-Dateien fuer das eSIM-Profil (OPL / PNN / SPN)
-# Diese drei Dateien liegen auf der SIM, nicht im Netz. pKOM berechnet die Werte
-# passend zu Kennung + Netzname; sie werden im eSIM-Profil eingetragen.
 GSM7 = ("@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ\x1bÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
         "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà")
 
@@ -675,16 +818,20 @@ def gsm7_codes(s):
     return [GSM7.index(ch) if ch in GSM7 and ch not in "\n\r\x1b" else 0x3F for ch in (s or "")]
 
 def gsm7_pack(codes):
-    bits = n = 0; out = bytearray()
+    bits = n = 0
+    out = bytearray()
     for c in codes:
-        bits |= (c & 0x7F) << n; n += 7
+        bits |= (c & 0x7F) << n
+        n += 7
         while n >= 8:
-            out.append(bits & 0xFF); bits >>= 8; n -= 8
-    if n: out.append(bits & 0xFF)
+            out.append(bits & 0xFF)
+            bits >>= 8
+            n -= 8
+    if n:
+        out.append(bits & 0xFF)
     return bytes(out), (8 - (len(codes) * 7) % 8) % 8
 
 def _nn_ie(tag, name):
-    """Netzname-IE (TS 24.008 10.5.3.5a): GSM-7, ohne Laenderkuerzel."""
     packed, spare = gsm7_pack(gsm7_codes(name))
     body = bytes([0x80 | spare]) + packed
     return bytes([tag, len(body)]) + body
@@ -695,69 +842,70 @@ def plmn_bcd(mcc, mnc):
 
 def sim_files():
     mcc, mnc = C.get("MCC", ""), C.get("MNC", "")
-    full = C.get("NETNAME") or "pKOM"; short = C.get("NETNAME_SHORT") or full
+    full = C.get("NETNAME") or "pKOM"
+    short = C.get("NETNAME_SHORT") or full
     spn = (C.get("SPN") or full)[:16]
-    try: plmn = plmn_bcd(mcc, mnc)
-    except Exception: plmn = b"\xff\xff\xff"
-    spn_b = bytes([0x00]) + bytes(gsm7_codes(spn)) + b"\xff" * (16 - len(spn))
+    try:
+        plmn = plmn_bcd(mcc, mnc)
+    except Exception:
+        plmn = b"\xff\xff\xff"
+    spn_b = bytes([0x00]) + bytes(gsm7_codes(spn)) + b"\xff" * max(0, 16 - len(spn))
     pnn = _nn_ie(0x43, full) + _nn_ie(0x45, short)
-    opl = plmn + b"\x00\x00\xff\xfe\x01"          # LAC/TAC 0000-FFFE -> PNN-Eintrag 1
+    opl = plmn + b"\x00\x00\xff\xfe\x01"
     hx = lambda b: b.hex().upper()
     return {"spn": hx(spn_b), "pnn": hx(pnn), "opl": hx(opl), "plmn": hx(plmn),
             "hplmn": mcc + mnc, "spn_text": spn, "full": full, "short": short}
 
 # ---- SMS ueber osmo-msc VTY
-# Die MSC puffert MT-SMS in ihrer DB und stellt sie beim Einbuchen zu - der
-# Teilnehmer muss beim Senden also nicht zwingend schon angemeldet sein.
-# Absender ist eine freie Nummer (GSM_SMS_FROM), kein echter Teilnehmer noetig.
 def _extern_nr(nummer):
-    """Interne Nummer -> extern erreichbare Nummer (Vorwahl-Block + interne Nummer)."""
     nummer = re.sub(r"\D", "", nummer or "")
-    if not nummer: return ""
+    if not nummer:
+        return ""
     pref = C.get("GSM_SMS_EXTPREFIX", "").strip()
     return (pref + nummer) if pref else nummer
 
 def _sms_text(tmpl, nummer=""):
     t = (tmpl or "").replace("{netz}", C.get("NETNAME", "")) \
                     .replace("{extern}", _extern_nr(nummer)).replace("{nummer}", nummer)
-    t = re.sub(r'[\r\n\t?"]', " ", t)          # VTY-Zeile: keine Umbrueche/Tabs/?-Hilfe/Quotes
+    t = re.sub(r'[\r\n\t?"]', " ", t)
     return re.sub(r"\s+", " ", t).strip()[:160]
 
 def sms_send(imsi, text, force=False):
     imsi = re.sub(r"\D", "", imsi or "")
     if FAKE or not gsm_on() or not imsi or not text:
         return
-    if C.get("GSM_SMS", "1") != "1" and not force:   # Auto-SMS aus (Test ignoriert das)
+    if C.get("GSM_SMS", "1") != "1" and not force:
         return
     frm = re.sub(r"\D", "", C.get("GSM_SMS_FROM", "")) or "1000"
-    r = vty(MSC_VTY, ["enable",
-                      f"subscriber imsi {imsi} sms sender msisdn {frm} send {text}"])
-    if "% " in r:
-        log("sms-fehler:", (r.strip().splitlines() or [r])[-1][:140])
+    r = vty(MSC_VTY, ["enable", f"subscriber imsi {imsi} sms sender msisdn {frm} send {text}"])
+    ok, err = vty_ok(r)
+    if not ok:
+        log("sms-fehler:", err)
 
 def sms_test(imsi, text=""):
     imsi = re.sub(r"\D", "", imsi or "")
-    if len(imsi) < 14:  return "IMSI angeben (14-15 Ziffern)"
-    if FAKE:            return "Testmodus (FAKE): nichts gesendet"
-    if not gsm_on(): return "GSM-Netz laeuft nicht (GSM oder LTE + GSM starten)"
+    if len(imsi) < 14:
+        return "IMSI angeben (14-15 Ziffern)"
+    if FAKE:
+        return "Testmodus (FAKE): nichts gesendet"
+    if not gsm_on():
+        return "GSM-Netz laeuft nicht (GSM oder LTE + GSM starten)"
     txt = _sms_text(text) if (text or "").strip() else _sms_text(C.get("GSM_SMS_WELCOME", ""))
     sms_send(imsi, txt, force=True)
     return f"Test-SMS an {imsi} gesendet"
 
 def msc_attached():
-    """IMSIs, die aktuell in der MSC (VLR) eingebucht sind."""
     if FAKE or not gsm_on():
         return set()
     txt = vty(MSC_VTY, ["enable", "show subscriber cache"])
     return set(re.findall(r"IMSI\D{0,3}(\d{14,15})", txt))
 
 def sms_welcome_watch():
-    """Hintergrund: neue Einbuchungen erkennen und einmalig begruessen."""
     while True:
         try:
             if gsm_on() and NET.state == "laeuft" and C.get("GSM_SMS", "1") == "1":
                 for imsi in msc_attached() - NET.welcomed:
-                    NET.welcomed.add(imsi)      # vor dem Senden merken: kein Spam bei Fehler
+                    NET.welcomed.add(imsi)
                     log("willkommens-sms ->", imsi)
                     sms_send(imsi, _sms_text(C.get("GSM_SMS_WELCOME", "")))
         except Exception as e:
@@ -765,63 +913,69 @@ def sms_welcome_watch():
         time.sleep(6)
 
 # ================================================================== LTE: srsENB (Funk) + Open5GS (Kern)
-# Open5GS statt srsEPC, weil nur dessen MME die SGs-Schnittstelle zur osmo-msc
-# hat (CSFB). Die Open5GS-Dienste laufen nicht ueber systemd, sondern werden von
-# pKOM mit eigenen Konfigs gestartet (Vorlage: /etc/open5gs/*.yaml).
 O5_ETC = "/etc/open5gs"
 O5_DIR = os.path.join(WORKDIR, "open5gs")
 O5_NFS = [("nrf", "open5gs-nrfd"), ("scp", "open5gs-scpd"), ("hss", "open5gs-hssd"),
           ("pcrf", "open5gs-pcrfd"), ("sgwc", "open5gs-sgwcd"), ("sgwu", "open5gs-sgwud"),
           ("smf", "open5gs-smfd"), ("upf", "open5gs-upfd"), ("mme", "open5gs-mmed")]
 O5_OPTIONAL = {"nrf", "scp"}
-UE_NET, UE_GW = "10.45.0.0/16", "10.45.0.1/16"       # Open5GS-Standard (smf/upf.yaml)
+UE_NET, UE_GW = "10.45.0.0/16", "10.45.0.1/16"
 NPRB_MHZ = {6: 1.4, 15: 3, 25: 5, 50: 10, 75: 15, 100: 20}
 SGS_PORT = 29118
 
 def _plmn_walk(o, mcc, mnc):
-    """Jede PLMN-Angabe (mcc/mnc) in einer Open5GS-Konfig auf die eigene Kennung setzen."""
     if isinstance(o, dict):
         if "mcc" in o and "mnc" in o:
-            o["mcc"] = mcc; o["mnc"] = mnc      # als Text: fuehrende Nullen + MNC-Laenge bleiben
-        for v in o.values(): _plmn_walk(v, mcc, mnc)
+            o["mcc"] = mcc
+            o["mnc"] = mnc
+        for v in o.values():
+            _plmn_walk(v, mcc, mnc)
     elif isinstance(o, list):
-        for v in o: _plmn_walk(v, mcc, mnc)
+        for v in o:
+            _plmn_walk(v, mcc, mnc)
 
 def gsm_lac():
     try:
-        t = open(os.path.join(WORKDIR, "osmo-bsc.cfg")).read()
+        with open(os.path.join(WORKDIR, "osmo-bsc.cfg"), encoding="utf-8", errors="replace") as f:
+            t = f.read()
         m = re.search(r"(?m)^\s*location_area_code\s+(?:lac\s+)?(0x[0-9a-fA-F]+|\d+)", t)
-        if m: return int(m.group(1), 0)
-    except Exception: pass
+        if m:
+            return int(m.group(1), 0)
+    except Exception:
+        pass
     return 1
 
 def o5_prepare(csfb, etc=O5_ETC, outdir=O5_DIR):
-    """Open5GS-Konfigs erzeugen. Rueckgabe: {nf: (binary, yaml-pfad)} in Startreihenfolge."""
     import yaml
     os.makedirs(outdir, exist_ok=True)
-    mcc, mnc = C["MCC"], C["MNC"]; tac = int(C.get("LTE_TAC") or 7)
+    mcc, mnc = C["MCC"], C["MNC"]
+    tac = int(C.get("LTE_TAC") or 7)
     plmn = {"mcc": mcc, "mnc": mnc}
     out = {}
     for nf, binary in O5_NFS:
         src = os.path.join(etc, nf + ".yaml")
         if not os.path.isfile(src):
-            if nf in O5_OPTIONAL: continue
+            if nf in O5_OPTIONAL:
+                continue
             raise RuntimeError(f"{src} fehlt - ist Open5GS installiert?")
-        o = yaml.safe_load(open(src)) or {}
-        o.pop("logger", None)                       # Log nach stdout -> Protokoll-Tab
+        with open(src, encoding="utf-8", errors="replace") as f:
+            o = yaml.safe_load(f) or {}
         _plmn_walk(o, mcc, mnc)
         if nf == "mme":
             m = o.setdefault("mme", {})
-            if C.get("NITZ", "1") == "1":           # EMM-Information: Netzname + Zeit/Zeitzone
+            if C.get("NITZ", "1") == "1":
                 m["network_name"] = {"full": C["NETNAME"], "short": C.get("NETNAME_SHORT") or C["NETNAME"]}
             else:
                 m.pop("network_name", None)
             tai = m.get("tai")
             tais = tai if isinstance(tai, list) else ([tai] if isinstance(tai, dict) else [])
-            for t in tais: t["tac"] = tac
-            if not tais: m["tai"] = [{"plmn_id": dict(plmn), "tac": tac}]
-            new_fmt = isinstance(m.get("s1ap"), dict)   # Open5GS >= 2.7
-            o.pop("sgsap", None); m.pop("sgsap", None)
+            for t in tais:
+                t["tac"] = tac
+            if not tais:
+                m["tai"] = [{"plmn_id": dict(plmn), "tac": tac}]
+            new_fmt = isinstance(m.get("s1ap"), dict)
+            o.pop("sgsap", None)
+            m.pop("sgsap", None)
             if csfb:
                 mp = {"tai": {"plmn_id": dict(plmn), "tac": tac},
                       "lai": {"plmn_id": dict(plmn), "lac": gsm_lac()}}
@@ -831,7 +985,7 @@ def o5_prepare(csfb, etc=O5_ETC, outdir=O5_DIR):
                 else:
                     o["sgsap"] = [{"addr": "127.0.0.1", "port": SGS_PORT, "map": mp}]
         dst = os.path.join(outdir, nf + ".yaml")
-        with open(dst, "w") as f:
+        with open(dst, "w", encoding="utf-8") as f:
             yaml.safe_dump(o, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
         out[nf] = (binary, dst)
     return out
@@ -839,46 +993,51 @@ def o5_prepare(csfb, etc=O5_ETC, outdir=O5_DIR):
 SRS_MARK = {"sib.conf": r"(?m)^sib1\s*=", "rr.conf": r"(?m)^cell_list\s*=", "rb.conf": r"(?m)^\w+\s*="}
 
 def _srs_template(name):
-    """Vorlage suchen - nur Dateien, die wirklich den erwarteten Inhalt haben
-    (eine leere/falsche /etc/srsran/sib.conf fuehrte zu 'section sib1 not found')."""
     cands = (os.path.join(SRS_CFG, name), f"/usr/local/share/srsran/{name}.example",
              f"/usr/share/srsran/{name}.example", f"/usr/share/srsran/{name}",
              f"/usr/share/doc/srsran/examples/{name}.example")
     for p in cands:
-        try: t = open(p, encoding="utf-8", errors="replace").read()
-        except OSError: continue
-        if re.search(SRS_MARK.get(name, r"\S"), t): return p
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                t = f.read()
+        except OSError:
+            continue
+        if re.search(SRS_MARK.get(name, r"\S"), t):
+            return p
         log(f"srsRAN-Vorlage {p} unbrauchbar - uebersprungen")
     return None
 
 def _drop_block(t, name):
-    """libconfig-Block 'name = { ... };' entfernen (Klammern gezaehlt)."""
     m = re.search(rf"(?m)^{name}\s*=\s*\{{", t)
-    if not m: return t
-    i = t.index("{", m.start()); depth = 0
+    if not m:
+        return t
+    i = t.index("{", m.start())
+    depth = 0
     for j in range(i, len(t)):
-        if t[j] == "{": depth += 1
+        if t[j] == "{":
+            depth += 1
         elif t[j] == "}":
             depth -= 1
             if depth == 0:
                 k = j + 1
-                while k < len(t) and t[k] in " \t;": k += 1
+                while k < len(t) and t[k] in " \t;":
+                    k += 1
                 return t[:m.start()] + t[k:]
     return t
 
 def _si_mapping(t, add7):
     def f(m):
         nums = [x.strip() for x in m.group(2).split(",") if x.strip() and x.strip() != "7"]
-        if add7: nums.append("7")
+        if add7:
+            nums.append("7")
         return m.group(1) + ", ".join(nums) + m.group(3)
     return re.sub(r"(si_mapping_info\s*=\s*\[\s*)([^\]]*?)(\s*\])", f, t, count=1)
 
 def sib_patch(t, csfb, arfcn):
-    """SIB7 (GERAN-Nachbar) nur im CSFB-Modus: srsENB schickt das Handy bei
-    einem Anruf per RRC-Release mit Umleitung auf genau diese GSM-Frequenz."""
     t = _drop_block(t, "sib7")
     t = _si_mapping(t, csfb)
     if csfb:
+        band_ind = "pcs1900" if gsm_band(arfcn) == "PCS1900" else "dcs1800"
         t = t.rstrip() + f"""
 
 // pKOM: GSM-Zelle fuer CS-Fallback (Anrufe)
@@ -894,7 +1053,7 @@ sib7 =
             thresh_x_high = 2;
             thresh_x_low = 2;
             start_arfcn = {arfcn};
-            band_ind = "{'pcs1900' if gsm_band() == 'PCS1900' else 'dcs1800'}";
+            band_ind = "{band_ind}";
             explicit_list_of_arfcns = ( {arfcn} );
         }}
     );
@@ -905,18 +1064,28 @@ sib7 =
 def enb_prepare(csfb, serial):
     for f in ("rr.conf", "sib.conf", "rb.conf"):
         p = _srs_template(f)
-        if not p: raise RuntimeError(f"srsRAN-Vorlage {f} fehlt - ist srsran installiert?")
+        if not p:
+            raise RuntimeError(f"srsRAN-Vorlage {f} fehlt - ist srsran installiert?")
         shutil.copy(p, os.path.join(WORKDIR, f))
-    earfcn = int(C["LTE_EARFCN"]); tac = int(C.get("LTE_TAC") or 7)
-    rr = os.path.join(WORKDIR, "rr.conf"); t = open(rr).read()
+    earfcn = int(C["LTE_EARFCN"])
+    tac = int(C.get("LTE_TAC") or 7)
+    rr = os.path.join(WORKDIR, "rr.conf")
+    with open(rr, encoding="utf-8", errors="replace") as f:
+        t = f.read()
     t = re.sub(r"(?m)^(\s*tac\s*=\s*)[^;]+;", r"\g<1>0x%04X;" % tac, t, count=1)
-    t = re.sub(r"(?m)^(\s*dl_earfcn\s*=\s*)\d+;", r"\g<1>%d;" % earfcn, t, count=1)  # 1. = eigene Zelle
-    open(rr, "w").write(t)
+    t = re.sub(r"(?m)^(\s*dl_earfcn\s*=\s*)\d+;", r"\g<1>%d;" % earfcn, t, count=1)
+    with open(rr, "w", encoding="utf-8") as f:
+        f.write(t)
+
     sib = os.path.join(WORKDIR, "sib.conf")
-    with open(sib) as f: t = f.read()          # erst lesen - open(...,"w") leert die Datei sofort
-    with open(sib, "w") as f: f.write(sib_patch(t, csfb, int(C["GSM_ARFCN"])))
+    with open(sib, encoding="utf-8", errors="replace") as f:
+        t = f.read()
+    with open(sib, "w", encoding="utf-8") as f:
+        f.write(sib_patch(t, csfb, int(C["GSM_ARFCN"])))
+
     dev = "driver=lime" + (",serial=" + serial if serial else "")
-    open(os.path.join(WORKDIR, "enb.conf"), "w").write(f"""# pKOM - automatisch erzeugt
+    with open(os.path.join(WORKDIR, "enb.conf"), "w", encoding="utf-8") as f:
+        f.write(f"""# pKOM - automatisch erzeugt
 [enb]
 enb_id = 0x19B
 mcc = {C['MCC']}
@@ -938,16 +1107,76 @@ rx_gain = {C['LTE_RX_GAIN']}
 device_name = soapy
 device_args = {dev}
 
+{_enb_expert()}
 [log]
 all_level = warning
 filename = stdout
 """)
 
+def _enb_expert():
+    if C.get("LTE_LOWCPU", "1") != "1":
+        return ""
+    # Uplink-Decoder ist der groesste CPU-Fresser: 8-Bit-Rechenweg + max. 4 Halb-Iterationen
+    return """[expert]
+pusch_8bit_decoder = true
+pusch_max_its = 4
+"""
+
+# ---- CPU: Taktregler + Auslastung --------------------------------------
+_GOV_SAVED = {}
+
+def cpu_governor(perf):
+    """perf=True: alle Kerne auf 'performance' (srsENB warnt sonst), alte Werte merken.
+    perf=False: gemerkte Werte zurueck. Ohne cpufreq (VM) passiert nichts."""
+    if FAKE: return
+    import glob
+    for p in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor"):
+        try:
+            if perf:
+                cur = open(p).read().strip()
+                if cur != "performance":
+                    _GOV_SAVED.setdefault(p, cur)
+                    open(p, "w").write("performance")
+            elif p in _GOV_SAVED:
+                open(p, "w").write(_GOV_SAVED.pop(p))
+        except OSError: pass
+
+def cpu_governor_now():
+    try: return open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").read().strip()
+    except OSError: return ""
+
+class CpuMeter:
+    """Gesamtlast aus /proc/stat und Anteil je pKOM-Prozess aus /proc/<pid>/stat."""
+    def __init__(self):
+        self.last = None; self.plast = {}; self.total = 0.0; self.per = {}
+        self.ncpu = os.cpu_count() or 1
+    def sample(self, procs):
+        try:
+            f = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+        except OSError:
+            return
+        idle, tot = f[3] + (f[4] if len(f) > 4 else 0), sum(f)
+        per = {}
+        for tag, p in procs.items():
+            try:
+                s = open(f"/proc/{p.pid}/stat").read().rsplit(")", 1)[1].split()
+                per[tag] = int(s[11]) + int(s[12])            # utime + stime
+            except Exception: pass
+        if self.last:
+            dt = tot - self.last[1]
+            if dt > 0:
+                self.total = round(100.0 * (1 - (idle - self.last[0]) / dt), 1)
+                # Prozent eines Kerns (wie top): Ticks / (Gesamt-Ticks / Kerne)
+                self.per = {t: round(100.0 * (v - self.plast.get(t, v)) * self.ncpu / dt)
+                            for t, v in per.items()}
+        self.last = (idle, tot); self.plast = per
+
+CPU = CpuMeter()
+
 def _run(*cmd):
     return subprocess.run(list(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
 
 def ue_net_up():
-    """Tunnel fuer die Handy-Datenverbindungen + NAT ins Internet."""
     _run("modprobe", "sctp")
     _run("ip", "tuntap", "add", "name", "ogstun", "mode", "tun")
     _run("ip", "addr", "replace", UE_GW, "dev", "ogstun")
@@ -957,16 +1186,18 @@ def ue_net_up():
                       ["-t", "nat", "-A", "POSTROUTING", "-s", UE_NET, "!", "-o", "ogstun", "-j", "MASQUERADE"]),
                      (["-C", "FORWARD", "-i", "ogstun", "-j", "ACCEPT"], ["-I", "FORWARD", "-i", "ogstun", "-j", "ACCEPT"]),
                      (["-C", "FORWARD", "-o", "ogstun", "-j", "ACCEPT"], ["-I", "FORWARD", "-o", "ogstun", "-j", "ACCEPT"])):
-        if _run("iptables", *chk) != 0: _run("iptables", *add)
+        if _run("iptables", *chk) != 0:
+            _run("iptables", *add)
 
 def freq_clash():
-    """GSM-Traeger darf nicht im LTE-Kanal liegen (gleiches Band 1800 MHz)."""
     try:
-        g = arfcn_mhz(int(C["GSM_ARFCN"])); l = earfcn_mhz(int(C["LTE_EARFCN"]))
+        g = arfcn_mhz(int(C["GSM_ARFCN"]))
+        l = earfcn_mhz(int(C["LTE_EARFCN"]))
         bw = NPRB_MHZ.get(int(C["LTE_NPRB"]), 5)
         if g and l and abs(g - l) < bw / 2 + 0.3:
             return f"GSM {g} MHz liegt im LTE-Kanal {l} MHz ±{bw/2:g} - andere ARFCN/EARFCN waehlen"
-    except Exception: pass
+    except Exception:
+        pass
     return None
 
 def preflight(mode):
@@ -978,9 +1209,11 @@ def preflight(mode):
     if mode in ("gsm", "csfb") and not gsm_band():
         return f"GSM-ARFCN {C['GSM_ARFCN']} liegt in keinem Band - im Tab GSM Band und Kanal waehlen"
     if mode in ("lte", "csfb"):
-        e = int(C["LTE_EARFCN"]); b = earfcn_band(e)
-        if not b: return f"EARFCN {e} liegt in keinem unterstuetzten LTE-Band - im Tab LTE waehlen"
-        half = int(NPRB_MHZ.get(int(C["LTE_NPRB"]), 5) * 5)        # halbe Bandbreite in 100-kHz-Schritten
+        e = int(C["LTE_EARFCN"])
+        b = earfcn_band(e)
+        if not b:
+            return f"EARFCN {e} liegt in keinem unterstuetzten LTE-Band - im Tab LTE waehlen"
+        half = int(NPRB_MHZ.get(int(C["LTE_NPRB"]), 5) * 5)
         lo, hi = LTE_BANDS[b][3], LTE_BANDS[b][4]
         if e - half < lo or e + half > hi:
             return f"EARFCN {e}: {NPRB_MHZ.get(int(C['LTE_NPRB']), 5):g} MHz passen nicht ins Band {b} ({lo + half}-{hi - half} moeglich)"
@@ -989,16 +1222,21 @@ def preflight(mode):
         if not FAKE and (not g or not l or g == l):
             return "LTE + GSM braucht zwei verschiedene LimeSDR - im Tab Steuerung zuordnen"
         e = freq_clash()
-        if e: return e
+        if e:
+            return e
     if not FAKE:
         need = []
-        if mode in ("gsm", "csfb"): need += [b for _n, b, _c in GSM_CORE]
+        if mode in ("gsm", "csfb"):
+            need += [b for _n, b, _c in GSM_CORE]
         if mode in ("lte", "csfb"):
             need += ["srsenb"] + [b for nf, b in O5_NFS if nf not in O5_OPTIONAL]
-            try: import yaml  # noqa
-            except ImportError: return "python3-yaml fehlt (Installer erneut ausfuehren)"
+            try:
+                import yaml  # noqa: F401
+            except ImportError:
+                return "python3-yaml fehlt (Installer erneut ausfuehren)"
         miss = [b for b in need if not shutil.which(b)]
-        if miss: return "Fehlt: " + ", ".join(miss) + " (Installer erneut ausfuehren)"
+        if miss:
+            return "Fehlt: " + ", ".join(miss) + " (Installer erneut ausfuehren)"
         if mode == "csfb" and osmo_has("osmo-msc", "sgs") is False:
             return "Diese osmo-msc kann kein SGs (CSFB) - neuere Osmocom-Version noetig"
     NET.dev_gsm, NET.dev_lte = g, l
@@ -1010,26 +1248,32 @@ MODES = {"gsm": "GSM (2G)", "lte": "LTE (4G)", "csfb": "LTE + GSM (CSFB)"}
 class Net:
     def __init__(self):
         self.lock = threading.RLock()
-        self.tech = None          # None | "gsm" | "lte" | "csfb"
-        self.state = "aus"        # aus | startet | laeuft | fehler
+        self.tech = None
+        self.state = "aus"
         self.msg = ""
         self.procs = {}
         self.loglines = []
         self.started = 0.0
-        self.welcomed = set()     # IMSIs, die in dieser Netz-Session schon begruesst wurden
+        self.welcomed = set()
         self.dev_gsm = self.dev_lte = ""
-        self.cmds = {}            # tag -> (binary, args, gruppe) fuer Einzel-Neustarts
-        self.busy = ""            # laufender Teil-Neustart
+        self.cmds = {}
+        self.busy = ""
+        self.rt_errors = 0        # srsENB: late/underflow/overflow (CPU zu langsam / USB)
 
     def _log(self, tag, line):
         line = line.rstrip()
-        if not line: return
-        print(f"{tag}: {line}", flush=True)   # -> journald, damit 'journalctl -u g90net' alles zeigt
-        self.loglines.append(f"{tag}: {line}")
-        if len(self.loglines) > 600: self.loglines = self.loglines[-600:]
-        low = line.lower()
-        if ("fatal" in low or "failed to create radio" in low) and tag not in GSM_NONFATAL:
-            self.msg = f"{tag}: {line[:120]}"
+        if not line:
+            return
+        print(f"{tag}: {line}", flush=True)
+        with self.lock:
+            self.loglines.append(f"{tag}: {line}")
+            if len(self.loglines) > 600:
+                self.loglines = self.loglines[-600:]
+            low = line.lower()
+            if tag == "enb" and re.search(r"\b(late|underflow|overflow)\b", low):
+                self.rt_errors += 1
+            if ("fatal" in low or "failed to create radio" in low) and tag not in GSM_NONFATAL:
+                self.msg = f"{tag}: {line[:120]}"
 
     def _reader(self, p, tag):
         try:
@@ -1038,55 +1282,90 @@ class Net:
         except Exception:
             pass
         rc = p.poll()
-        if self.procs.get(tag) is p and self.state == "laeuft" and tag not in GSM_NONFATAL:
-            self.msg = f"{tag} beendet (Code {rc}) - siehe Protokoll"
+        with self.lock:
+            if self.procs.get(tag) is p and self.state == "laeuft" and tag not in GSM_NONFATAL:
+                self.msg = f"{tag} beendet (Code {rc}) - siehe Protokoll"
 
     def _spawn(self, binary, args, tag, group=""):
         p = subprocess.Popen([binary] + args, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, bufsize=1)
-        self.procs[tag] = p
-        self.cmds[tag] = (binary, args, group or self.cmds.get(tag, ("", [], ""))[2])
+        with self.lock:
+            self.procs[tag] = p
+            self.cmds[tag] = (binary, args, group or self.cmds.get(tag, ("", [], ""))[2])
         threading.Thread(target=self._reader, args=(p, tag), daemon=True).start()
         return p
 
     def stop(self):
         with self.lock:
             if FAKE:
-                self.tech = None; self.state = "aus"; self.procs = {}; return
+                self.tech = None
+                self.state = "aus"
+                self.procs = {}
+                self.cmds = {}
+                self.busy = ""
+                return
+            was_running = bool(self.tech)
             procs, self.procs = self.procs, {}
             self.cmds = {}
-            for tag, p in list(procs.items()):
-                try: p.terminate()
-                except Exception: pass
+            self.busy = ""
+            for _tag, p in list(procs.items()):
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
             time.sleep(1)
             for name in OSMO_SERVICES + ["srsenb", "srsepc", "open5gs-"]:
-                try: subprocess.run(["pkill", "-9", "-f", name],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception: pass
-            if self.tech:
-                _lime_service("start")   # G90-Empfang wieder frei geben
-            self.tech = None; self.state = "aus"; self.msg = "gestoppt"
+                try:
+                    subprocess.run(["pkill", "-9", "-f", name],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+            cpu_governor(False)
+            if was_running:
+                _lime_service("start")
+            self.tech = None
+            self.state = "aus"
+            self.msg = "gestoppt"
 
     def start(self, mode):
-        if mode not in MODES: return "unbekannter Modus"
+        if mode not in MODES:
+            return "unbekannter Modus"
         with self.lock:
-            self.stop(); self.tech = mode; self.state = "startet"; self.msg = ""
-            self.loglines = []; self.started = time.time(); self.welcomed = set()
-        err = preflight(mode)
-        if err:
-            with self.lock: self.tech = None; self.state = "fehler"; self.msg = err
-            return err
-        if FAKE:
-            with self.lock:
-                self.state = "laeuft"; self.msg = MODES[mode] + " laeuft (FAKE)"
-                if mode in ("gsm", "csfb"):
-                    for n, b, _c in gsm_components(): self.cmds[n] = (b, [], "gsm")
-                if mode in ("lte", "csfb"):
-                    for n, b in O5_NFS: self.cmds[n] = (b, [], "lte")
-                    self.cmds["enb"] = ("srsenb", [], "lte")
-            return None
-        gsm, lte = mode in ("gsm", "csfb"), mode in ("lte", "csfb")
+            if self.busy:
+                return f"Neustart von {self.busy} laeuft noch"
+            self.busy = "start"
         try:
+            with self.lock:
+                self.stop()
+                self.busy = "start"
+                self.tech = mode
+                self.state = "startet"
+                self.msg = ""
+                self.loglines = []
+                self.started = time.time()
+                self.welcomed = set()
+                self.rt_errors = 0
+            err = preflight(mode)
+            if err:
+                with self.lock:
+                    self.tech = None
+                    self.state = "fehler"
+                    self.msg = err
+                return err
+            if FAKE:
+                with self.lock:
+                    self.state = "laeuft"
+                    self.msg = MODES[mode] + " laeuft (FAKE)"
+                    if mode in ("gsm", "csfb"):
+                        for n, b, _c in gsm_components():
+                            self.cmds[n] = (b, [], "gsm")
+                    if mode in ("lte", "csfb"):
+                        for n, b in O5_NFS:
+                            self.cmds[n] = (b, [], "lte")
+                        self.cmds["enb"] = ("srsenb", [], "lte")
+                return None
+
+            gsm, lte = mode in ("gsm", "csfb"), mode in ("lte", "csfb")
             if gsm:
                 self._services_off(OSMO_SERVICES)
                 gsm_prepare()
@@ -1096,25 +1375,42 @@ class Net:
                 enb_prepare(mode == "csfb", self.dev_lte)
                 _run("systemctl", "start", "mongod")
                 e = hss_sync_all()
-                if e: self._log("pkom", "HSS: " + e)
-            if self.dev_gsm: self._log("pkom", "GSM-Funk: " + lime_label(self.dev_gsm))
-            if self.dev_lte: self._log("pkom", "LTE-Funk: " + lime_label(self.dev_lte))
-            _lime_service("stop"); time.sleep(1); _free_lime(); time.sleep(2)
-            if gsm: self._run_gsm()
-            if lte: self._run_lte(nfs)
-            with self.lock: self.state = "laeuft"; self.msg = MODES[mode] + " gestartet"
+                if e:
+                    self._log("pkom", "HSS: " + e)
+            if self.dev_gsm:
+                self._log("pkom", "GSM-Funk: " + lime_label(self.dev_gsm))
+            if self.dev_lte:
+                self._log("pkom", "LTE-Funk: " + lime_label(self.dev_lte))
+            if C.get("CPU_PERF", "1") == "1":
+                cpu_governor(True)
+            _lime_service("stop")
+            time.sleep(1)
+            _free_lime()
+            time.sleep(2)
+            if gsm:
+                self._run_gsm()
+            if lte:
+                self._run_lte(nfs)
+            with self.lock:
+                self.state = "laeuft"
+                self.msg = MODES[mode] + " gestartet"
+            return None
         except Exception as e:
-            with self.lock: self.state = "fehler"; self.msg = str(e)[:200]
+            with self.lock:
+                self.state = "fehler"
+                self.msg = str(e)[:200]
             return str(e)
-        return None
+        finally:
+            with self.lock:
+                self.busy = ""
 
-    # ---- Teile starten / einzeln neu starten ----------------------------
     def _run_gsm(self):
         for name, binary, cfg in gsm_components():
             flag = "-C" if binary.startswith("osmo-trx") else "-c"
             self._spawn(binary, [flag, os.path.join(WORKDIR, cfg)], name, "gsm")
             time.sleep(4 if name in ("trx",) else 1.2)
-        time.sleep(1); gsm_apply_numbers()   # SIMs + dauerhafte Rufnummern ins HLR
+        time.sleep(1)
+        gsm_apply_numbers()
 
     def _run_lte(self, nfs, core=True):
         if core:
@@ -1126,87 +1422,117 @@ class Net:
         self._spawn("srsenb", [os.path.join(WORKDIR, "enb.conf")], "enb", "lte")
 
     def _kill(self, tags):
-        """Prozesse beenden, ohne dass der Leser 'beendet' meldet."""
-        ps = [(t, self.procs.pop(t)) for t in list(tags) if t in self.procs]
+        with self.lock:
+            ps = [(t, self.procs.pop(t)) for t in list(tags) if t in self.procs]
         for _t, p in ps:
-            try: p.terminate()
-            except Exception: pass
-        for _t, p in ps:
-            try: p.wait(timeout=6)
+            try:
+                p.terminate()
             except Exception:
-                try: p.kill(); p.wait(timeout=3)
-                except Exception: pass
+                pass
+        for _t, p in ps:
+            try:
+                p.wait(timeout=6)
+            except Exception:
+                try:
+                    p.kill()
+                    p.wait(timeout=3)
+                except Exception:
+                    pass
 
     def parts(self):
-        """Was einzeln neu gestartet werden kann (je nach Modus)."""
-        t = self.tech or ""
+        with self.lock:
+            t = self.tech or ""
         out = []
-        if t in ("gsm", "csfb"): out.append(("gsm", "GSM komplett"))
-        if t in ("lte", "csfb"): out += [("lte", "4G komplett"), ("enb", "4G-Funk (eNB)")]
+        if t in ("gsm", "csfb"):
+            out.append(("gsm", "GSM komplett"))
+        if t in ("lte", "csfb"):
+            out += [("lte", "4G komplett"), ("enb", "4G-Funk (eNB)")]
         return out
 
     def restart(self, part):
-        """part: 'gsm' | 'lte' | 'core' | 'enb' | Prozessname (z.B. 'msc', 'mme')."""
         with self.lock:
             if self.state not in ("laeuft", "fehler") or not self.tech:
                 return "Netz laeuft nicht"
-            if self.busy: return f"Neustart von {self.busy} laeuft noch"
+            if self.busy:
+                return f"Neustart von {self.busy} laeuft noch"
             gsm, lte = self.tech in ("gsm", "csfb"), self.tech in ("lte", "csfb")
-            if part == "gsm" and not gsm or part in ("lte", "enb") and not lte:
+            if (part == "gsm" and not gsm) or (part in ("lte", "enb") and not lte):
                 return "Teil ist im aktuellen Modus nicht aktiv"
             if part not in ("gsm", "lte", "enb") and part not in self.cmds:
                 return f"unbekannter Teil '{part}'"
             self.busy = part
-        label = dict(self.parts()).get(part, part)
+            label = dict(self.parts()).get(part, part)
+            self.msg = f"{label} startet neu ..."
+            cmd_info = self.cmds.get(part)
+            csfb_mode = self.tech == "csfb"
+            dev_lte = self.dev_lte
         self._log("pkom", f"Neustart: {label}")
-        self.msg = f"{label} startet neu ..."
         try:
             if FAKE:
                 time.sleep(0.5)
             elif part == "gsm":
-                self._kill([t for t, c in self.cmds.items() if c[2] == "gsm"])
-                gsm_prepare(); self._run_gsm()
+                with self.lock:
+                    gsm_tags = [t for t, c in self.cmds.items() if c[2] == "gsm"]
+                self._kill(gsm_tags)
+                gsm_prepare()
+                self._run_gsm()
             elif part == "lte":
-                self._kill([t for t, c in self.cmds.items() if c[2] == "lte"])
-                nfs = o5_prepare(self.tech == "csfb")
-                enb_prepare(self.tech == "csfb", self.dev_lte)
+                with self.lock:
+                    lte_tags = [t for t, c in self.cmds.items() if c[2] == "lte"]
+                self._kill(lte_tags)
+                nfs = o5_prepare(csfb_mode)
+                enb_prepare(csfb_mode, dev_lte)
                 e = hss_sync_all()
-                if e: self._log("pkom", "HSS: " + e)
+                if e:
+                    self._log("pkom", "HSS: " + e)
                 self._run_lte(nfs)
             elif part == "enb":
-                self._kill(["enb"]); enb_prepare(self.tech == "csfb", self.dev_lte)
+                self._kill(["enb"])
+                enb_prepare(csfb_mode, dev_lte)
                 self._run_lte({}, core=False)
             else:
-                binary, args, grp = self.cmds[part]
-                self._kill([part]); time.sleep(0.5)
+                binary, args, grp = cmd_info
+                self._kill([part])
+                time.sleep(0.5)
                 self._spawn(binary, args, part, grp)
-                if part == "hlr": time.sleep(1.5); gsm_apply_numbers()
-            with self.lock: self.state = "laeuft"; self.msg = f"{label} neu gestartet"
+                if part == "hlr":
+                    time.sleep(1.5)
+                    gsm_apply_numbers()
+            with self.lock:
+                self.state = "laeuft"
+                self.msg = f"{label} neu gestartet"
             return None
         except Exception as e:
-            with self.lock: self.msg = f"Neustart {label} fehlgeschlagen: {str(e)[:160]}"
+            with self.lock:
+                self.msg = f"Neustart {label} fehlgeschlagen: {str(e)[:160]}"
             return str(e)
         finally:
-            self.busy = ""
+            with self.lock:
+                self.busy = ""
 
     def proc_list(self):
-        out = []
-        for tag, (_b, _a, grp) in self.cmds.items():
-            p = self.procs.get(tag)
-            rc = None if p is None else p.poll()
-            out.append({"tag": tag, "group": grp, "run": p is not None and rc is None,
-                        "rc": rc if p is not None else "-"})
-        return out
+        with self.lock:
+            out = []
+            for tag, (_b, _a, grp) in self.cmds.items():
+                p = self.procs.get(tag)
+                rc = None if p is None else p.poll()
+                out.append({"tag": tag, "group": grp, "run": p is not None and rc is None,
+                            "rc": rc if p is not None else "-"})
+            return out
 
-    # Kompatibilitaet
-    def start_gsm(self): return self.start("gsm")
-    def start_lte(self): return self.start("lte")
+    def start_gsm(self):
+        return self.start("gsm")
+
+    def start_lte(self):
+        return self.start("lte")
 
     def _services_off(self, names):
         for s in names:
-            try: subprocess.run(["systemctl", "stop", s.replace("open5gs-", "open5gs-") + ".service"],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
-            except Exception: pass
+            try:
+                subprocess.run(["systemctl", "stop", s + ".service"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+            except Exception:
+                pass
 
     def status(self):
         with self.lock:
@@ -1237,6 +1563,9 @@ class Net:
                 "fake": FAKE,
                 "parts": [{"id": i, "name": n} for i, n in self.parts()],
                 "procs": self.proc_list(), "busy": self.busy,
+                "cpu": {"total": CPU.total, "ncpu": CPU.ncpu, "gov": cpu_governor_now(),
+                        "top": sorted(CPU.per.items(), key=lambda x: -x[1])[:4],
+                        "rt_errors": self.rt_errors},
             }
         return st
 
@@ -1258,41 +1587,48 @@ def handle_api(path, body):
     elif cmd == "restart":
         part = re.sub(r"[^a-z0-9_-]", "", str(req.get("part", "")).lower())
         err = NET.restart(part)
-        if err: NET.msg = err
+        if err:
+            NET.msg = err
     elif cmd == "lime_scan":
-        n = len(lime_scan()); NET.msg = f"{n} LimeSDR gefunden"
+        n = len(lime_scan())
+        NET.msg = f"{n} LimeSDR gefunden"
     elif cmd == "set":
-        # beliebige Konfig-Keys setzen (validiert light)
         for k, v in req.items():
             if k in DEFAULTS or k in C:
                 v = str(v).replace('"', "").replace("\n", " ").strip()
                 if k in ("MCC", "MNC", "LTE_TAC", "GSM_ARFCN", "LTE_EARFCN", "LTE_NPRB"):
                     v = re.sub(r"\D", "", v)
-                    if not v and k not in ("MCC", "MNC"): continue     # leer -> alten Wert behalten
-                if k == "GSM_BAND" and v not in GSM_BANDS: v = ""
+                    if not v and k not in ("MCC", "MNC"):
+                        continue
+                if k == "GSM_BAND" and v not in GSM_BANDS:
+                    v = ""
                 cset(k, v)
         NET.msg = "gespeichert - wirkt beim naechsten Start"
         if C.get("GSM_DEV") and C.get("GSM_DEV") == C.get("LTE_DEV"):
             NET.msg = "Achtung: GSM und LTE nutzen denselben LimeSDR - fuer LTE + GSM zwei Geraete waehlen"
     elif cmd in ("sim_add", "gsm_sim_add", "lte_sim_add"):
-        NET.msg = sim_add(req.get("imsi",""), req.get("ki",""), req.get("opc",""), req.get("msisdn","")) \
+        NET.msg = sim_add(req.get("imsi", ""), req.get("ki", ""), req.get("opc", ""), req.get("msisdn", "")) \
                   or "SIM gespeichert (GSM + LTE)"
     elif cmd in ("sim_del", "gsm_sim_del", "lte_sim_del"):
-        sim_del(req.get("imsi","")); NET.msg = "SIM geloescht"
+        sim_del(req.get("imsi", ""))
+        NET.msg = "SIM geloescht"
     elif cmd == "gsm_sim_nr":
-        NET.msg = gsm_sim_nr(req.get("imsi",""), req.get("msisdn","")) or "Rufnummer dauerhaft zugewiesen"
+        NET.msg = gsm_sim_nr(req.get("imsi", ""), req.get("msisdn", "")) or "Rufnummer dauerhaft zugewiesen"
     elif cmd == "gsm_num_del":
-        gsm_num_del(req.get("imsi","")); NET.msg = "Rufnummer-Zuweisung geloescht"
+        gsm_num_del(req.get("imsi", ""))
+        NET.msg = "Rufnummer-Zuweisung geloescht"
     elif cmd == "sim_gen":
         try:
             gen = sim_generate(req.get("count", 1), req.get("msisdn", ""), req.get("iccid", ""))
             NET.msg = f"{len(gen)} SIM-Datensatz/-saetze erzeugt"
         except Exception as e:
-            gen = []; NET.msg = "Erzeugen fehlgeschlagen: %s" % e
-        st = NET.status(); st["generated"] = gen
+            gen = []
+            NET.msg = "Erzeugen fehlgeschlagen: %s" % e
+        st = NET.status()
+        st["generated"] = gen
         return st
     elif cmd == "sms_test":
-        NET.msg = sms_test(req.get("imsi",""), req.get("text",""))
+        NET.msg = sms_test(req.get("imsi", ""), req.get("text", ""))
     else:
         NET.msg = "unbekannt"
     return NET.status()
@@ -1389,11 +1725,11 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
 
  <div class=tabs>
   <button class="tab sel" data-t=steuerung onclick="tab('steuerung')">Steuerung</button>
-  <button class=tab data-t=gsm onclick="tab('gsm')">GSM · 2G</button>
-  <button class=tab data-t=lte onclick="tab('lte')">LTE · 4G</button>
-  <button class=tab data-t=sims onclick="tab('sims')">SIMs & Nummern</button>
-  <button class=tab data-t=profil onclick="tab('profil')">SIM-Profil</button>
-  <button class=tab data-t=log onclick="tab('log')">Protokoll</button>
+  <button class="tab" data-t=gsm onclick="tab('gsm')">GSM · 2G</button>
+  <button class="tab" data-t=lte onclick="tab('lte')">LTE · 4G</button>
+  <button class="tab" data-t=sims onclick="tab('sims')">SIMs & Nummern</button>
+  <button class="tab" data-t=profil onclick="tab('profil')">SIM-Profil</button>
+  <button class="tab" data-t=log onclick="tab('log')">Protokoll</button>
  </div>
 
  <div class="panel sel" id=p-steuerung>
@@ -1414,6 +1750,13 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
     <div id=parts style=display:flex;gap:8px;flex-wrap:wrap></div>
     <div id=procs class=procs></div>
     <div class=hint id=parthint>Startet, sobald ein Netz läuft.</div>
+   </div>
+   <div class=card>
+    <h2>CPU-Last</h2>
+    <div style="font-size:28px;font-weight:600" id=cpuTotal>–</div>
+    <div class=sub id=cpuInfo></div>
+    <div id=cpuTop class=procs></div>
+    <div class=hint id=cpuHint></div>
    </div>
    <div class=card>
     <h2>Funk-Hardware</h2>
@@ -1465,9 +1808,9 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
     <h2>GSM-Optionen</h2>
     <div class="sw first"><div class=t>Offene Anmeldung<small>jede SIM wird eingebucht</small></div>
      <label class=switch><input type=checkbox id=GSM_OPEN><span class=slider></span></label></div>
-    <div class=sw><div class=t>EDGE / GPRS-Daten<small>Paketdaten (pcu/sgsn/ggsn)</small></div>
+    <div class="sw"><div class=t>EDGE / GPRS-Daten<small>Paketdaten (pcu/sgsn/ggsn)</small></div>
      <label class=switch><input type=checkbox id=GSM_DATA><span class=slider></span></label></div>
-    <div class=sw><div class=t>SIP-Trunk zu Asterisk<small>Anrufe ins VoIP/Festnetz</small></div>
+    <div class="sw"><div class=t>SIP-Trunk zu Asterisk<small>Anrufe ins VoIP/Festnetz</small></div>
      <label class=switch><input type=checkbox id=GSM_SIP><span class=slider></span></label></div>
     <label>SIP-Peer (Asterisk-IP)</label><input id=GSM_SIP_PEER>
     <label>SIP-Local-IP (leer = automatisch)</label><input id=GSM_SIP_LOCAL>
@@ -1516,7 +1859,12 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
     <div class=row><div><label>TX-Gain</label><input id=LTE_TX_GAIN></div>
      <div><label>RX-Gain</label><input id=LTE_RX_GAIN></div></div>
     <label>APN</label><input id=LTE_APN>
-    <button class=btn onclick="save(['LTE_TX_GAIN','LTE_RX_GAIN','LTE_APN'])">Speichern</button>
+    <div class="sw first"><div class=t>CPU-Sparmodus<small>8-Bit-Uplink-Decoder, max. 4 Iterationen – deutlich weniger Last, minimal schlechterer Uplink</small></div>
+     <label class=switch><input type=checkbox id=LTE_LOWCPU><span class=slider></span></label></div>
+    <div class="sw"><div class=t>Takt auf „performance“<small>CPU läuft während des Betriebs mit vollem Takt (weniger Aussetzer)</small></div>
+     <label class=switch><input type=checkbox id=CPU_PERF><span class=slider></span></label></div>
+    <button class=btn onclick="save(['LTE_TX_GAIN','LTE_RX_GAIN','LTE_APN','LTE_LOWCPU','CPU_PERF'])">Speichern</button>
+    <p class=hint>Sparmodus und Takt wirken beim nächsten Start von LTE (oder Neustart „enb“).</p>
     <p class=hint>LTE braucht SIMs mit Ki/OPc (Tab „SIMs“). Kern: Open5GS, Handy-Netz 10.45.0.0/16 mit NAT ins Internet. Bei „LTE + GSM“ darf die GSM-Frequenz nicht im LTE-Kanal liegen.</p>
    </div>
   </div>
@@ -1628,7 +1976,7 @@ function updateFreq(keepSel){let g=gsmInfo($('GSM_ARFCN').value);$('gsm_mhz').te
   $('lte_range').innerHTML='EARFCN im Band '+sb.band+': '+(sb.lo+h)+'–'+(sb.hi-h)+' (bei dieser Bandbreite)'+(fit?'':' · <b style=color:var(--err)>passt nicht ins Band</b>');}
  else $('lte_range').textContent='';}
 function setv(id,v){let el=$(id);if(!el)return;if(el.type==='checkbox')el.checked=(v==='1'||v===true);else el.value=(v==null?'':v);}
-const FIELDS=['MCC','MNC','NETNAME','NETNAME_SHORT','SPN','NITZ','GSM_DEV','LTE_DEV','GSM_BAND','GSM_ARFCN','GSM_TX_GAIN','GSM_RX_GAIN','GSM_SIP_PEER','GSM_SIP_LOCAL','GSM_OPEN','GSM_DATA','GSM_SIP','GSM_SMS','GSM_SMS_FROM','GSM_SMS_EXTPREFIX','GSM_SMS_WELCOME','GSM_SMS_NUMBER','LTE_EARFCN','LTE_NPRB','LTE_TX_GAIN','LTE_RX_GAIN','LTE_APN'];
+const FIELDS=['MCC','MNC','NETNAME','NETNAME_SHORT','SPN','NITZ','GSM_DEV','LTE_DEV','GSM_BAND','GSM_ARFCN','GSM_TX_GAIN','GSM_RX_GAIN','GSM_SIP_PEER','GSM_SIP_LOCAL','GSM_OPEN','GSM_DATA','GSM_SIP','GSM_SMS','GSM_SMS_FROM','GSM_SMS_EXTPREFIX','GSM_SMS_WELCOME','GSM_SMS_NUMBER','LTE_EARFCN','LTE_NPRB','LTE_TX_GAIN','LTE_RX_GAIN','LTE_APN','LTE_LOWCPU','CPU_PERF'];
 let filled=false,limeKey='';
 function limeOptions(s){
  const L=s.limes||[],c=s.conf||{},key=JSON.stringify(L)+(c.GSM_DEV||'')+(c.LTE_DEV||'');
@@ -1642,7 +1990,14 @@ function limeOptions(s){
 function reloadFields(){const c=S.conf||{};FIELDS.forEach(k=>{if(document.activeElement!==$(k))setv(k,c[k]);});filled=true;updateFreq();}
 function fmt(s){const m=Math.floor(s/60),h=Math.floor(m/60);return h?h+'h '+(m%60)+'m':(m?m+'m '+(s%60)+'s':s+'s');}
 function renderlog(){const f=($('logfilter').value||'').toLowerCase();let L=(S.log||[]);if(f)L=L.filter(x=>x.toLowerCase().includes(f));const lg=$('log');const near=lg.scrollTop+lg.clientHeight>=lg.scrollHeight-40;lg.textContent=L.join('\n');$('logcount').textContent=L.length+' Zeilen';if(near)lg.scrollTop=lg.scrollHeight;}
-function render(s){S=s;fillBands(s);limeOptions(s);if(!filled)reloadFields();
+function renderCpu(s){const c=s.cpu;if(!c)return;
+ $('cpuTotal').textContent=Math.round(c.total)+' %';
+ $('cpuInfo').textContent=c.ncpu+' Kerne · Taktregler: '+(c.gov||'unbekannt')+' · Zeitfehler Funk: '+c.rt_errors;
+ $('cpuTop').textContent=(c.top||[]).map(x=>x[0]+' '+x[1]+' %').join('   ');
+ const h=$('cpuHint');
+ if(c.rt_errors>20){h.style.color='var(--err)';h.textContent='Funk kommt nicht hinterher (late/underflow). Bandbreite auf 5 MHz (25 PRB) senken oder CPU-Sparmodus einschalten.';}
+ else{h.style.color='';h.textContent='Volle Last beim Speedtest ist normal, solange die Zeitfehler nahe 0 bleiben.';}}
+function render(s){S=s;fillBands(s);limeOptions(s);if(!filled)reloadFields();renderCpu(s);
  const run=s.state==='laeuft',t=s.tech;
  $('dot').className='dot '+(run?'on':(s.state==='fehler'?'err':''));
  $('state').textContent=s.state;$('msg').textContent=s.msg||'';
@@ -1695,15 +2050,20 @@ poll();setInterval(poll,2500);
 </script></body></html>"""
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
+    def log_message(self, *a):
+        pass
+
     def _send(self, code, body, ctype="application/json"):
         b = body.encode() if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
-        try: self.wfile.write(b)
-        except Exception: pass
+        try:
+            self.wfile.write(b)
+        except Exception:
+            pass
+
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self._send(200, PAGE, "text/html; charset=utf-8")
@@ -1711,6 +2071,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(NET.status()))
         else:
             self._send(404, "{}")
+
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(n).decode(errors="replace") if n else ""
@@ -1718,17 +2079,29 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self._send(200, json.dumps(handle_api(self.path, body)))
             except Exception as e:
-                log("api:", e); self._send(500, json.dumps({"error": str(e)}))
+                log("api:", e)
+                self._send(500, json.dumps({"error": str(e)}))
         else:
             self._send(404, "{}")
+
+def _cpu_loop():
+    while True:
+        try:
+            CPU.sample(dict(NET.procs))
+        except Exception:
+            pass
+        time.sleep(2)
 
 def main():
     port = int(C.get("WEB_PORT", "8080"))
     log(f"g90net Web-Oberflaeche auf http://0.0.0.0:{port}  (FAKE={FAKE})")
     threading.Thread(target=sms_welcome_watch, daemon=True).start()
-    threading.Thread(target=lime_scan, daemon=True).start()   # LimeSDR fuer die Auswahl suchen
-    try: _migrate_lte_db()
-    except Exception as e: log("migration:", e)
+    threading.Thread(target=lime_scan, daemon=True).start()
+    threading.Thread(target=_cpu_loop, daemon=True).start()
+    try:
+        _migrate_lte_db()
+    except Exception as e:
+        log("migration:", e)
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 if __name__ == "__main__":
