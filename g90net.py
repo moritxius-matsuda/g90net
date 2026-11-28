@@ -39,7 +39,6 @@ DEFAULTS = {
     # 4G
     "LTE_EARFCN": "1575", "LTE_NPRB": "25", "LTE_TX_GAIN": "80", "LTE_RX_GAIN": "40",
     "LTE_APN": "internet", "LTE_TAC": "7",
-    "LTE_LOWCPU": "1",        # srsENB: 8-Bit-Turbodecoder, wenige Iterationen (schwache CPUs)
     "CPU_PERF": "1",          # CPU-Takt waehrend des Betriebs auf "performance"
 }
 
@@ -1107,20 +1106,11 @@ rx_gain = {C['LTE_RX_GAIN']}
 device_name = soapy
 device_args = {dev}
 
-{_enb_expert()}
 [log]
 all_level = warning
 filename = stdout
 """)
 
-def _enb_expert():
-    if C.get("LTE_LOWCPU", "1") != "1":
-        return ""
-    # Uplink-Decoder ist der groesste CPU-Fresser: 8-Bit-Rechenweg + max. 4 Halb-Iterationen
-    return """[expert]
-pusch_8bit_decoder = true
-pusch_max_its = 4
-"""
 
 # ---- CPU: Taktregler + Auslastung --------------------------------------
 _GOV_SAVED = {}
@@ -1859,12 +1849,10 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
     <div class=row><div><label>TX-Gain</label><input id=LTE_TX_GAIN></div>
      <div><label>RX-Gain</label><input id=LTE_RX_GAIN></div></div>
     <label>APN</label><input id=LTE_APN>
-    <div class="sw first"><div class=t>CPU-Sparmodus<small>8-Bit-Uplink-Decoder, max. 4 Iterationen – deutlich weniger Last, minimal schlechterer Uplink</small></div>
-     <label class=switch><input type=checkbox id=LTE_LOWCPU><span class=slider></span></label></div>
-    <div class="sw"><div class=t>Takt auf „performance“<small>CPU läuft während des Betriebs mit vollem Takt (weniger Aussetzer)</small></div>
+    <div class="sw first"><div class=t>Takt auf „performance“<small>CPU läuft während des Betriebs mit vollem Takt (weniger Aussetzer)</small></div>
      <label class=switch><input type=checkbox id=CPU_PERF><span class=slider></span></label></div>
-    <button class=btn onclick="save(['LTE_TX_GAIN','LTE_RX_GAIN','LTE_APN','LTE_LOWCPU','CPU_PERF'])">Speichern</button>
-    <p class=hint>Sparmodus und Takt wirken beim nächsten Start von LTE (oder Neustart „enb“).</p>
+    <button class=btn onclick="save(['LTE_TX_GAIN','LTE_RX_GAIN','LTE_APN','CPU_PERF'])">Speichern</button>
+    <p class=hint>Der Takt wirkt beim nächsten Start von LTE (oder Neustart „enb“).</p>
     <p class=hint>LTE braucht SIMs mit Ki/OPc (Tab „SIMs“). Kern: Open5GS, Handy-Netz 10.45.0.0/16 mit NAT ins Internet. Bei „LTE + GSM“ darf die GSM-Frequenz nicht im LTE-Kanal liegen.</p>
    </div>
   </div>
@@ -1976,7 +1964,7 @@ function updateFreq(keepSel){let g=gsmInfo($('GSM_ARFCN').value);$('gsm_mhz').te
   $('lte_range').innerHTML='EARFCN im Band '+sb.band+': '+(sb.lo+h)+'–'+(sb.hi-h)+' (bei dieser Bandbreite)'+(fit?'':' · <b style=color:var(--err)>passt nicht ins Band</b>');}
  else $('lte_range').textContent='';}
 function setv(id,v){let el=$(id);if(!el)return;if(el.type==='checkbox')el.checked=(v==='1'||v===true);else el.value=(v==null?'':v);}
-const FIELDS=['MCC','MNC','NETNAME','NETNAME_SHORT','SPN','NITZ','GSM_DEV','LTE_DEV','GSM_BAND','GSM_ARFCN','GSM_TX_GAIN','GSM_RX_GAIN','GSM_SIP_PEER','GSM_SIP_LOCAL','GSM_OPEN','GSM_DATA','GSM_SIP','GSM_SMS','GSM_SMS_FROM','GSM_SMS_EXTPREFIX','GSM_SMS_WELCOME','GSM_SMS_NUMBER','LTE_EARFCN','LTE_NPRB','LTE_TX_GAIN','LTE_RX_GAIN','LTE_APN','LTE_LOWCPU','CPU_PERF'];
+const FIELDS=['MCC','MNC','NETNAME','NETNAME_SHORT','SPN','NITZ','GSM_DEV','LTE_DEV','GSM_BAND','GSM_ARFCN','GSM_TX_GAIN','GSM_RX_GAIN','GSM_SIP_PEER','GSM_SIP_LOCAL','GSM_OPEN','GSM_DATA','GSM_SIP','GSM_SMS','GSM_SMS_FROM','GSM_SMS_EXTPREFIX','GSM_SMS_WELCOME','GSM_SMS_NUMBER','LTE_EARFCN','LTE_NPRB','LTE_TX_GAIN','LTE_RX_GAIN','LTE_APN','CPU_PERF'];
 let filled=false,limeKey='';
 function limeOptions(s){
  const L=s.limes||[],c=s.conf||{},key=JSON.stringify(L)+(c.GSM_DEV||'')+(c.LTE_DEV||'');
@@ -1995,7 +1983,7 @@ function renderCpu(s){const c=s.cpu;if(!c)return;
  $('cpuInfo').textContent=c.ncpu+' Kerne · Taktregler: '+(c.gov||'unbekannt')+' · Zeitfehler Funk: '+c.rt_errors;
  $('cpuTop').textContent=(c.top||[]).map(x=>x[0]+' '+x[1]+' %').join('   ');
  const h=$('cpuHint');
- if(c.rt_errors>20){h.style.color='var(--err)';h.textContent='Funk kommt nicht hinterher (late/underflow). Bandbreite auf 5 MHz (25 PRB) senken oder CPU-Sparmodus einschalten.';}
+ if(c.rt_errors>20){h.style.color='var(--err)';h.textContent='Funk kommt nicht hinterher (late/underflow). Bandbreite senken (10 MHz = 50 PRB oder 5 MHz = 25 PRB).';}
  else{h.style.color='';h.textContent='Volle Last beim Speedtest ist normal, solange die Zeitfehler nahe 0 bleiben.';}}
 function render(s){S=s;fillBands(s);limeOptions(s);if(!filled)reloadFields();renderCpu(s);
  const run=s.state==='laeuft',t=s.tech;
