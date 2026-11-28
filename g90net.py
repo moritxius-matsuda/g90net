@@ -456,6 +456,7 @@ def gsm_prepare():
     if os.path.isfile(msc):
         with open(msc, encoding="utf-8", errors="replace") as f:
             t = _strip_sgs_block(f.read())
+        t = msc_logging(t)
         if NET.tech == "csfb":
             t = t.rstrip("\n") + f"\nsgs\n local-port {SGS_PORT}\n local-ip 127.0.0.1\n vlr-name vlr.pkom.test\n"
         with open(msc, "w", encoding="utf-8") as f:
@@ -1232,6 +1233,289 @@ def preflight(mode):
     NET.dev_gsm, NET.dev_lte = g, l
     return None
 
+# ================================================================== Anrufprotokoll (EVN)
+# Quelle 1: osmo-msc-Log (Kategorie cc, Stufe info): "trans(CC:... IMSI-..:MSISDN-.. callref-0x.. ) SETUP to <nr>"
+# Quelle 2: VTY "show transaction" alle 2 s: Zustand (ACTIVE = verbunden) und Ende eines Gespraechs.
+# LTE hat keine eigene Sprache (kein VoLTE): Anrufe laufen per CSFB ueber GSM und landen hier ebenfalls.
+CALLS_FILE = os.path.join(WORKDIR, "calls.jsonl")
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+def parse_transactions(txt):
+    """VTY 'show transaction' -> Liste von CC-Transaktionen."""
+    out = []
+    for blk in re.split(r"Transaction #\d+:", txt or "")[1:]:
+        if not re.search(r"Type:\s*CC\b", blk):
+            continue
+        m = re.search(r"identifier:\s*0x([0-9a-fA-F]+)", blk)
+        if not m:
+            continue
+        sub = re.search(r"Subscriber:\s*(\S+)", blk)
+        sub = sub.group(1) if sub else ""
+        imsi = re.search(r"IMSI-?(\d{5,15})", sub)
+        nr = re.search(r"MSISDN-?(\d+)", sub)
+        st = re.search(r"Protocol specific:\s*(\S+)", blk)
+        mo = re.search(r"identifier \((MO|MT)\)", blk)
+        out.append({"callref": int(m.group(1), 16), "imsi": imsi.group(1) if imsi else "",
+                    "nr": nr.group(1) if nr else "", "state": st.group(1) if st else "",
+                    "dir": mo.group(1) if mo else ""})
+    return out
+
+class CallLog:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = {}          # callref -> Datensatz
+        self.legs = {}            # MT-callref -> callref des zugehoerigen MO-Gespraechs
+        self.rev = 0              # steigt bei jeder Aenderung (Oberflaeche laedt dann neu)
+
+    @staticmethod
+    def _local_numbers():
+        nums = {}
+        for i, s in sims_load().items():
+            if s.get("msisdn"):
+                nums[s["msisdn"]] = i
+        for i, n in nums_load().items():
+            if n:
+                nums[str(n)] = i
+        return nums
+
+    def on_log(self, line):
+        line = _ANSI.sub("", line)
+        m = re.search(r"callref-0x([0-9a-fA-F]+).*?\b(?:EMERGENCY_)?SETUP to (\S*)", line)
+        if not m:
+            return
+        cr = int(m.group(1), 16)
+        imsi = re.search(r"IMSI-?(\d{5,15})", line)
+        nr = re.search(r"MSISDN-?(\d+)", line)
+        an = m.group(2).strip()
+        with self.lock:
+            if cr in self.active:
+                return
+            loc = self._local_numbers()
+            self.active[cr] = {
+                "start": time.time(), "answered": None, "end": None,
+                "von_imsi": imsi.group(1) if imsi else "", "von": nr.group(1) if nr else "",
+                "an": an, "an_imsi": loc.get(an, ""),
+                "richtung": "intern" if an in loc else "abgehend",
+                "notseen": 0, "seen": False, "notruf": "EMERGENCY_SETUP" in line,
+            }
+            self.rev += 1
+
+    def update(self, trans):
+        now = time.time()
+        with self.lock:
+            seen = set()
+            for t in trans:
+                cr = t["callref"]
+                if t["dir"] == "MT" and cr not in self.active and cr not in self.legs:
+                    # Gegenstelle eines internen Gespraechs?  Sonst: Anruf von aussen (SIP)
+                    mo = next((k for k, c in self.active.items()
+                               if c["richtung"] == "intern" and not c.get("leg")
+                               and (c["an"] == t["nr"] or c["an_imsi"] == t["imsi"])), None)
+                    if mo is not None:
+                        self.legs[cr] = mo
+                        self.active[mo]["leg"] = cr
+                        self.active[mo]["an_imsi"] = t["imsi"] or self.active[mo]["an_imsi"]
+                    else:
+                        self.active[cr] = {"start": now, "answered": None, "end": None,
+                                           "von_imsi": "", "von": "extern", "an": t["nr"],
+                                           "an_imsi": t["imsi"], "richtung": "ankommend",
+                                           "notseen": 0, "seen": True, "notruf": False}
+                        self.rev += 1
+                key = self.legs.get(cr, cr)
+                c = self.active.get(key)
+                if not c:
+                    continue
+                seen.add(key)
+                c["seen"], c["notseen"] = True, 0
+                if c.get("von_imsi") == "" and t["dir"] == "MO" and key == cr:
+                    c["von_imsi"], c["von"] = t["imsi"], t["nr"] or c["von"]
+                if t["state"] == "ACTIVE" and not c["answered"]:
+                    c["answered"] = now
+                    self.rev += 1
+            for k in [k for k in self.active if k not in seen]:
+                c = self.active[k]
+                c["notseen"] += 1
+                # einmal gesehen -> weg = beendet; nie gesehen (sehr kurz) -> nach ~6 s abschliessen
+                if (c["seen"] and c["notseen"] >= 1) or (not c["seen"] and now - c["start"] > 6):
+                    self._finish(k, now)
+
+    def close_all(self):
+        with self.lock:
+            now = time.time()
+            for k in list(self.active):
+                self._finish(k, now)
+
+    def _finish(self, k, now):
+        c = self.active.pop(k)
+        if c.get("leg") is not None:
+            self.legs.pop(c["leg"], None)
+        c["end"] = now
+        c["dauer"] = int(round(now - c["answered"])) if c["answered"] else 0
+        c["status"] = "verbunden" if c["answered"] else "nicht angenommen"
+        rec = {x: c[x] for x in ("start", "answered", "end", "dauer", "status", "richtung",
+                                 "von", "von_imsi", "an", "an_imsi", "notruf")}
+        rec["start"] = round(rec["start"], 1)
+        try:
+            with open(CALLS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+        except OSError as e:
+            log("anrufliste:", e)
+        self.rev += 1
+
+    def history(self, limit=5000):
+        try:
+            with open(CALLS_FILE, encoding="utf-8") as f:
+                lines = f.readlines()[-limit:]
+        except OSError:
+            return []
+        out = []
+        for l in reversed(lines):
+            try:
+                out.append(json.loads(l))
+            except ValueError:
+                pass
+        return out
+
+    def live(self):
+        now = time.time()
+        with self.lock:
+            return [{"start": round(c["start"], 1), "von": c["von"], "von_imsi": c["von_imsi"],
+                     "an": c["an"], "an_imsi": c["an_imsi"], "richtung": c["richtung"],
+                     "status": "verbunden" if c["answered"] else "klingelt",
+                     "dauer": int(now - c["answered"]) if c["answered"] else 0}
+                    for c in sorted(self.active.values(), key=lambda c: c["start"])]
+
+    def clear(self):
+        with self.lock:
+            try:
+                os.replace(CALLS_FILE, CALLS_FILE + ".alt")   # eine Sicherung bleibt erhalten
+            except OSError:
+                pass
+            self.rev += 1
+
+CALLS = CallLog()
+
+def msc_logging(t):
+    """osmo-msc soll Rufaufbau (cc) auf Stufe info nach stderr schreiben - sonst fehlt die Zielnummer."""
+    t = re.sub(r"(?m)^[ \t]*logging level cc \S+[ \t]*\n", "", t)
+    if re.search(r"(?m)^log stderr[ \t]*$", t):
+        return re.sub(r"(?m)^(log stderr[ \t]*)$", r"\1\n logging level cc info", t, count=1)
+    return ("log stderr\n logging filter all 1\n logging color 0\n logging print category 1\n"
+            " logging timestamp 0\n logging level all notice\n logging level cc info\n") + t
+
+def _calls_loop():
+    was = False
+    while True:
+        try:
+            run = gsm_on() and NET.state == "laeuft"
+            if run and not FAKE:
+                CALLS.update(parse_transactions(vty(MSC_VTY, ["enable", "show transaction"])))
+            elif was:
+                CALLS.close_all()
+            was = run
+        except Exception as e:
+            log("anrufliste:", e)
+        time.sleep(2)
+
+# ================================================================== LTE-Datenlast (ogstun) mit Historie
+TRAFFIC_FILE = os.path.join(WORKDIR, "traffic.json")
+
+class Traffic:
+    """Durchsatz der Handy-Daten ueber 4G: ogstun tx = Downlink zum Handy, rx = Uplink.
+    Fein: 2-s-Werte der letzten 10 min.  Grob: Minutenmittel 24 h, 15-min-Mittel 7 Tage.
+    Tagesvolumen fuer 31 Tage.  Grob + Tage werden jede Minute gespeichert."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last = None
+        self.fine, self.min, self.q15, self.days = [], [], [], {}
+        self.acc_m, self.acc_q = [], []
+        self.down = self.up = 0.0
+        try:
+            with open(TRAFFIC_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            self.min, self.q15, self.days = d.get("min", []), d.get("q15", []), d.get("days", {})
+        except Exception:
+            pass
+
+    @staticmethod
+    def _read():
+        base = "/sys/class/net/ogstun/statistics/"
+        try:
+            with open(base + "rx_bytes") as a, open(base + "tx_bytes") as b:
+                return int(a.read()), int(b.read())
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _avg(rows, t):
+        n = len(rows)
+        return [int(t), round(sum(r[1] for r in rows) / n, 3), round(sum(r[2] for r in rows) / n, 3),
+                round(sum(r[3] for r in rows) / n, 1)]
+
+    def sample(self, cpu):
+        now = time.time()
+        if FAKE:
+            import math, random
+            k = (math.sin(now / 90) + 1) / 2
+            rx, tx = (0, 0) if self.last is None else (self.last[1], self.last[2])
+            rx += int(2e5 * k * random.random() * 2)
+            tx += int(1.6e6 * k * random.random() * 2)
+            cur = (rx, tx)
+        else:
+            cur = self._read()
+        with self.lock:
+            if cur is None:
+                self.last, self.down, self.up = None, 0.0, 0.0
+                return
+            if self.last:
+                dt = now - self.last[0]
+                d_rx = cur[0] - self.last[1] if cur[0] >= self.last[1] else cur[0]
+                d_tx = cur[1] - self.last[2] if cur[1] >= self.last[2] else cur[1]
+                if dt > 0:
+                    self.down = round(d_tx * 8 / dt / 1e6, 3)     # Mbit/s
+                    self.up = round(d_rx * 8 / dt / 1e6, 3)
+                    row = [int(now), self.down, self.up, cpu]
+                    self.fine = (self.fine + [row])[-300:]
+                    self.acc_m.append(row)
+                    self.acc_q.append(row)
+                    day = time.strftime("%Y-%m-%d")
+                    v = self.days.setdefault(day, [0, 0])
+                    v[0] += d_tx
+                    v[1] += d_rx
+            self.last = (now, cur[0], cur[1])
+            if self.acc_m and now - self.acc_m[0][0] >= 60:
+                self.min = (self.min + [self._avg(self.acc_m, now)])[-1440:]
+                self.acc_m = []
+                if now - self.acc_q[0][0] >= 900:
+                    self.q15 = (self.q15 + [self._avg(self.acc_q, now)])[-672:]
+                    self.acc_q = []
+                for k in sorted(self.days)[:-31]:
+                    del self.days[k]
+                self._save()
+
+    def _save(self):
+        try:
+            tmp = TRAFFIC_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"min": self.min, "q15": self.q15, "days": self.days}, f)
+            os.replace(tmp, TRAFFIC_FILE)
+        except OSError as e:
+            log("traffic:", e)
+
+    def series(self, rng):
+        with self.lock:
+            pts = {"10m": self.fine, "24h": self.min, "7d": self.q15}.get(rng, self.fine)
+            return {"range": rng, "points": list(pts),
+                    "days": sorted(([k] + v for k, v in self.days.items()), reverse=True)[:31]}
+
+    def now(self):
+        with self.lock:
+            today = self.days.get(time.strftime("%Y-%m-%d"), [0, 0])
+            return {"down": self.down, "up": self.up, "today_down": today[0], "today_up": today[1],
+                    "on": self.last is not None}
+
+TRAFFIC = Traffic()
+
 # ================================================================== Netz-Manager
 MODES = {"gsm": "GSM (2G)", "lte": "LTE (4G)", "csfb": "LTE + GSM (CSFB)"}
 
@@ -1260,6 +1544,8 @@ class Net:
             if len(self.loglines) > 600:
                 self.loglines = self.loglines[-600:]
             low = line.lower()
+            if tag == "msc" and "SETUP to" in line:
+                CALLS.on_log(line)
             if tag == "enb" and re.search(r"\b(late|underflow|overflow)\b", low):
                 self.rt_errors += 1
             if ("fatal" in low or "failed to create radio" in low) and tag not in GSM_NONFATAL:
@@ -1556,6 +1842,8 @@ class Net:
                 "cpu": {"total": CPU.total, "ncpu": CPU.ncpu, "gov": cpu_governor_now(),
                         "top": sorted(CPU.per.items(), key=lambda x: -x[1])[:4],
                         "rt_errors": self.rt_errors},
+                "traffic": TRAFFIC.now(),
+                "calls_live": CALLS.live(), "calls_rev": CALLS.rev,
             }
         return st
 
@@ -1617,6 +1905,13 @@ def handle_api(path, body):
         st = NET.status()
         st["generated"] = gen
         return st
+    elif cmd == "calls":
+        return {"calls": CALLS.history(), "live": CALLS.live(), "rev": CALLS.rev}
+    elif cmd == "calls_clear":
+        CALLS.clear()
+        NET.msg = "Anrufliste geleert (Sicherung: calls.jsonl.alt)"
+    elif cmd == "traffic":
+        return TRAFFIC.series(str(req.get("range", "10m")))
     elif cmd == "sms_test":
         NET.msg = sms_test(req.get("imsi", ""), req.get("text", ""))
     else:
@@ -1691,6 +1986,14 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
 .empty{color:var(--mut2);font-size:13px;padding:8px 0}
 .log{background:#030a18;border:1px solid var(--line);padding:14px;font:12px/1.55 var(--mono);height:440px;overflow:auto;white-space:pre-wrap;color:#9fb3d0}
 .toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px}.toolbar input{flex:1}
+.seg{display:inline-flex;border:1px solid var(--line2)}.seg button{border:0;background:0;color:var(--mut);font:inherit;font-size:12px;font-weight:700;padding:6px 12px;cursor:pointer;letter-spacing:.05em}.seg button.sel{background:var(--okbg);color:var(--acc)}
+.chartwrap{position:relative;margin-top:12px}#tchart{width:100%;height:260px;display:block;background:#030a18;border:1px solid var(--line)}
+#ttip{position:absolute;pointer-events:none;background:#0b1733;border:1px solid var(--line2);padding:6px 9px;font-size:12px;font-family:var(--mono);display:none;white-space:nowrap}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--mut);margin-top:8px}.legend i{display:inline-block;width:14px;height:3px;margin-right:6px;vertical-align:middle}
+.kpis{display:flex;gap:26px;flex-wrap:wrap;margin-top:6px}.kpis div{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.07em}.kpis b{display:block;font-size:22px;color:var(--fg);font-family:var(--mono);letter-spacing:0;text-transform:none}
+.filters{display:grid;grid-template-columns:2fr 1fr 2fr;gap:10px}@media(max-width:640px){.filters{grid-template-columns:1fr}}
+.calltbl td.n{font-family:var(--mono);white-space:nowrap}.calltbl td.r{text-align:right;font-family:var(--mono)}.st-ok{color:var(--acc)}.st-no{color:var(--mut)}
+.callwrap{overflow-x:auto;max-height:560px;overflow-y:auto;margin-top:8px}
 .ef{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}.ef th{text-align:left;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.07em;padding:8px 6px;border-bottom:1px solid var(--line2)}.ef td{padding:10px 6px;border-bottom:1px solid var(--line);vertical-align:top}.ef code{font-family:var(--mono);color:var(--acc);word-break:break-all;user-select:all}.mut{color:var(--mut);font-size:11px}.genwrap{overflow-x:auto;margin-top:12px}.genwrap .ef td,.genwrap .ef th{white-space:nowrap}.genwrap code{font-size:12px}.btn:disabled{opacity:.4;cursor:default}.procs{display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:6px;margin-top:12px}.proc{display:flex;align-items:center;justify-content:space-between;gap:6px;border:1px solid var(--line);border-radius:8px;padding:4px 4px 4px 8px;font-size:12px}.proc .pd{width:8px;height:8px;border-radius:50%;background:var(--err);flex:none}.proc .pd.on{background:var(--ok)}.proc span{flex:1;overflow:hidden;text-overflow:ellipsis}.proc button{border:0;background:transparent;color:var(--mut);cursor:pointer;font-size:15px;padding:2px 6px;border-radius:6px}.proc button:hover{color:var(--fg);background:var(--line)}code{font-family:var(--mono)}@media(max-width:560px){.row,.row3{grid-template-columns:1fr}}
 </style></head><body>
 <header>
@@ -1718,6 +2021,7 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
   <button class="tab" data-t=gsm onclick="tab('gsm')">GSM · 2G</button>
   <button class="tab" data-t=lte onclick="tab('lte')">LTE · 4G</button>
   <button class="tab" data-t=sims onclick="tab('sims')">SIMs & Nummern</button>
+  <button class="tab" data-t=anrufe onclick="tab('anrufe')">Anrufe</button>
   <button class="tab" data-t=profil onclick="tab('profil')">SIM-Profil</button>
   <button class="tab" data-t=log onclick="tab('log')">Protokoll</button>
  </div>
@@ -1828,6 +2132,15 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
  </div>
 
  <div class=panel id=p-lte>
+  <div class=card style=margin-bottom:16px>
+   <div class=toolbar style=justify-content:space-between;flex-wrap:wrap><h2 style=margin:0>Datenlast über 4G</h2>
+    <div class=seg id=trange><button data-r=10m class=sel onclick="setRange('10m')">10 Min</button><button data-r=24h onclick="setRange('24h')">24 Std</button><button data-r=7d onclick="setRange('7d')">7 Tage</button></div></div>
+   <div class=kpis><div>Download<b id=t_down>–</b></div><div>Upload<b id=t_up>–</b></div><div>Heute ↓<b id=t_tdown>–</b></div><div>Heute ↑<b id=t_tup>–</b></div><div>Spitze ↓ im Zeitraum<b id=t_peak>–</b></div></div>
+   <div class=chartwrap><canvas id=tchart></canvas><div id=ttip></div></div>
+   <div class=legend><span><i style=background:#2EC4F1></i>Download (zum Handy)</span><span><i style=background:#f1b24a></i>Upload</span><span><i style="background:repeating-linear-gradient(90deg,#8ea4ca 0 4px,transparent 4px 7px)"></i>CPU % (rechte Achse)</span></div>
+   <div class=hint id=t_hint></div>
+   <details style=margin-top:12px><summary class=mut style=cursor:pointer>Datenvolumen pro Tag</summary><table class=ef id=t_days></table></details>
+  </div>
   <div class=grid>
    <div class=card>
     <h2>LTE-Funk</h2>
@@ -1915,6 +2228,31 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(46,19
   </div>
  </div>
 
+ <div class=panel id=p-anrufe>
+  <div class=card style=margin-bottom:16px>
+   <h2>Laufende Gespräche</h2>
+   <div id=call_live class=hint>Keine.</div>
+  </div>
+  <div class=card>
+   <div class=toolbar style=justify-content:space-between;flex-wrap:wrap><h2 style=margin:0>Anrufliste</h2><span class=badge id=call_count></span></div>
+   <div class=filters>
+    <div><label>SIM / Teilnehmer</label><select id=f_sim onchange=renderCalls()><option value="">alle</option></select></div>
+    <div><label>Monat</label><input type=month id=f_month onchange=renderCalls()></div>
+    <div><label>Suche</label><input id=f_q placeholder="Nummer oder IMSI" oninput=renderCalls()></div>
+   </div>
+   <div class="sw first" style=margin-top:12px><div class=t>Zielnummern kürzen<small>externe Nummern: letzte 3 Ziffern als xxx – wie beim EVN üblich</small></div>
+    <label class=switch><input type=checkbox id=f_short onchange=renderCalls()><span class=slider></span></label></div>
+   <div class=hint id=call_sum></div>
+   <div class=callwrap><table class="ef calltbl" id=call_tab></table></div>
+   <div style=display:flex;gap:8px;flex-wrap:wrap>
+    <button class=btn onclick=evn()>Einzelverbindungsnachweis (CSV)</button>
+    <button class="btn sec" onclick=loadCalls(true)>Aktualisieren</button>
+    <button class="btn sec" onclick=callsClear()>Liste leeren</button>
+   </div>
+   <p class=hint>Erfasst werden alle Gespräche über GSM, auch Anrufe aus LTE per CSFB. Für ein EVN oben eine SIM und einen Monat wählen. Bei Anrufen von außen (SIP) kennt pKOM die Rufnummer des Anrufers nicht, dort steht „extern“.</p>
+  </div>
+ </div>
+
  <div class=panel id=p-log>
   <div class=card>
    <div class=toolbar><h2 style=margin:0>Protokoll</h2><input id=logfilter placeholder="filtern… z.B. GPRS, TBF, error" oninput=renderlog()><span class=badge id=logcount></span></div>
@@ -1928,7 +2266,7 @@ async function api(c,b){const r=await fetch('/api/'+c,{method:'POST',headers:{'C
 function $(i){return document.getElementById(i);}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function cmd(c){if(c.startsWith('start'))$('msg').textContent='startet…';api(c).then(r=>{if(c==='lime_scan')limeKey='';render(r);});}
-function tab(n){document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('sel',t.dataset.t===n));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('sel',p.id==='p-'+n));try{localStorage.setItem('pkom_tab',n);}catch(e){}}
+function tab(n){document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('sel',t.dataset.t===n));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('sel',p.id==='p-'+n));try{localStorage.setItem('pkom_tab',n);}catch(e){}if(n==='anrufe')loadCalls();if(n==='lte'){trLast=0;setTimeout(loadTraffic,30);}}
 function save(keys){let b={};keys.forEach(k=>{let el=$(k);b[k]=el.type==='checkbox'?(el.checked?'1':'0'):el.value;});api('set',b).then(r=>{filled=false;render(r);});}
 function simadd(){api('sim_add',{imsi:$('sim_imsi').value,ki:$('sim_ki').value,opc:$('sim_opc').value,msisdn:$('sim_nr').value}).then(r=>{if(!/aber|pruefen/.test(r.msg||'')){['sim_imsi','sim_ki','sim_opc','sim_nr'].forEach(i=>$(i).value='');}render(r);});}
 function simnr(){api('gsm_sim_nr',{imsi:$('gnum_imsi').value,msisdn:$('gnum_nr').value}).then(render);}
@@ -1985,7 +2323,7 @@ function renderCpu(s){const c=s.cpu;if(!c)return;
  const h=$('cpuHint');
  if(c.rt_errors>20){h.style.color='var(--err)';h.textContent='Funk kommt nicht hinterher (late/underflow). Bandbreite senken (10 MHz = 50 PRB oder 5 MHz = 25 PRB).';}
  else{h.style.color='';h.textContent='Volle Last beim Speedtest ist normal, solange die Zeitfehler nahe 0 bleiben.';}}
-function render(s){S=s;fillBands(s);limeOptions(s);if(!filled)reloadFields();renderCpu(s);
+function render(s){S=s;fillBands(s);limeOptions(s);if(!filled)reloadFields();renderCpu(s);renderLive(s);renderTraffic(s);
  const run=s.state==='laeuft',t=s.tech;
  $('dot').className='dot '+(run?'on':(s.state==='fehler'?'err':''));
  $('state').textContent=s.state;$('msg').textContent=s.msg||'';
@@ -2032,6 +2370,82 @@ function gendl(fmt){if(!GEN.length)return;let data,type,name='pkom-sims-'+new Da
  if(fmt==='json'){data=JSON.stringify(GEN,null,1);type='application/json';name+='.json';}
  else{const k=Object.keys(GEN[0]);data=[k.join(';')].concat(GEN.map(g=>k.map(x=>g[x]).join(';'))).join(String.fromCharCode(13,10));type='text/csv';name+='.csv';}
  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data],{type}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);}
+
+// ---------------- Anrufliste / EVN
+let CALLS=[],callsRev=-1,callsLoading=false;
+function simName(imsi,nr){if(nr==='extern')return 'extern';const s=(S.sims||[]).find(x=>x.imsi===imsi);return nr||(s&&s.msisdn)||imsi||'?';}
+function hms(s){s=Math.max(0,Math.round(s||0));const h=Math.floor(s/3600),m=Math.floor(s/60)%60,x=s%60;return (h?h+':':'')+String(m).padStart(h?2:1,'0')+':'+String(x).padStart(2,'0');}
+function dt(t){const d=new Date(t*1000);return d.toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit',year:'numeric'})+' '+d.toLocaleTimeString('de-DE');}
+function shortNr(n){return ($('f_short').checked&&/^\+?\d{6,}$/.test(n||''))?n.slice(0,-3)+'xxx':n;}
+async function loadCalls(force){if(callsLoading)return;callsLoading=true;try{const r=await api('calls');CALLS=(r.calls||[]).sort((a,b)=>b.start-a.start);callsRev=r.rev;renderCalls();}catch(e){}callsLoading=false;}
+function simOptions(){const sel=$('f_sim'),cur=sel.value,L=S.sims||[],key=JSON.stringify(L);if(sel.dataset.k===key)return;sel.dataset.k=key;
+ sel.innerHTML='<option value="">alle</option>'+L.map(s=>'<option value="'+esc(s.imsi)+'">'+esc((s.msisdn?s.msisdn+' · ':'')+s.imsi)+'</option>').join('');sel.value=cur;}
+function callRows(){const sim=$('f_sim').value,mon=$('f_month').value,q=($('f_q').value||'').trim();
+ return CALLS.filter(c=>{if(sim&&c.von_imsi!==sim&&c.an_imsi!==sim)return false;
+  if(mon){const d=new Date(c.start*1000);if(d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')!==mon)return false;}
+  if(q&&![c.von,c.an,c.von_imsi,c.an_imsi].some(x=>(x||'').includes(q)))return false;return true;});}
+function relDir(c,sim){if(!sim)return c.richtung;return c.von_imsi===sim?(c.richtung==='intern'?'abgehend (intern)':'abgehend'):(c.richtung==='intern'?'ankommend (intern)':'ankommend');}
+function renderCalls(){simOptions();const sim=$('f_sim').value,R=callRows();
+ $('call_count').textContent=R.length+' Anrufe';
+ const tot=R.reduce((a,c)=>a+(c.dauer||0),0),ok=R.filter(c=>c.status==='verbunden').length;
+ $('call_sum').textContent=R.length?(ok+' verbunden · '+(R.length-ok)+' nicht angenommen · Gesprächszeit gesamt '+hms(tot)):'Noch keine Anrufe in dieser Auswahl.';
+ $('call_tab').innerHTML='<tr><th>Datum · Uhrzeit</th><th>Von</th><th>An</th><th>Richtung</th><th>Status</th><th style=text-align:right>Dauer</th></tr>'+
+  R.slice(0,1000).map(c=>'<tr><td class=n>'+dt(c.start)+'</td><td class=n title="'+esc(c.von_imsi)+'">'+esc(simName(c.von_imsi,c.von))+'</td><td class=n title="'+esc(c.an_imsi)+'">'+esc(shortNr(c.an))+(c.notruf?' <b style=color:var(--err)>NOTRUF</b>':'')+'</td><td>'+esc(relDir(c,sim))+'</td><td class='+(c.status==='verbunden'?'st-ok':'st-no')+'>'+esc(c.status)+'</td><td class=r>'+hms(c.dauer)+'</td></tr>').join('');}
+function renderLive(s){const L=s.calls_live||[];
+ $('call_live').innerHTML=L.length?L.map(c=>'<div class=proc style="margin-top:6px;justify-content:flex-start;gap:12px"><span class="pd on"></span><b>'+esc(simName(c.von_imsi,c.von))+' → '+esc(c.an)+'</b><span class=mut>'+esc(c.status)+(c.status==='verbunden'?' · '+hms(c.dauer):'')+'</span></div>').join(''):'Keine.';
+ const t=document.querySelector('.tab[data-t=anrufe]');if(t)t.textContent='Anrufe'+(L.length?' ('+L.length+')':'');
+ if(s.calls_rev!==callsRev&&$('p-anrufe').classList.contains('sel'))loadCalls();}
+function csvq(v){v=String(v==null?'':v);return /[;"\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;}
+function evn(){const sim=$('f_sim').value,mon=$('f_month').value,R=callRows().slice().reverse(),NL=String.fromCharCode(13,10);
+ const s=(S.sims||[]).find(x=>x.imsi===sim);
+ const head=[['Einzelverbindungsnachweis',(S.conf&&S.conf.NETNAME)||'pKOM'],['Teilnehmer',sim?((s&&s.msisdn?s.msisdn+' / ':'')+'IMSI '+sim):'alle'],['Zeitraum',mon||'gesamt'],['Erstellt',new Date().toLocaleString('de-DE')],[]];
+ const cols=['Datum','Uhrzeit','Von','An','Richtung','Status','Dauer (h:mm:ss)','Sekunden'];
+ const rows=R.map(c=>{const d=new Date(c.start*1000);return [d.toLocaleDateString('de-DE'),d.toLocaleTimeString('de-DE'),simName(c.von_imsi,c.von),shortNr(c.an),relDir(c,sim),c.status,hms(c.dauer),c.dauer||0];});
+ const tot=R.reduce((a,c)=>a+(c.dauer||0),0);
+ const all=head.concat([cols],rows,[[],['Summe',R.length+' Anrufe','','','','',hms(tot),tot]]);
+ const data='﻿'+all.map(r=>r.map(csvq).join(';')).join(NL);
+ const name='evn-'+(s&&s.msisdn||sim||'alle')+'-'+(mon||'gesamt')+'.csv';
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data],{type:'text/csv'}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);}
+async function callsClear(){if(!confirm('Anrufliste wirklich leeren? Eine Sicherung (calls.jsonl.alt) bleibt erhalten, ältere Sicherungen werden überschrieben.'))return;render(await api('calls_clear'));loadCalls(true);}
+
+// ---------------- Datenlast 4G
+let TR={points:[],days:[]},trRange='10m',trLast=0,trHover=-1;
+function mbit(v){return v>=100?v.toFixed(0):v>=10?v.toFixed(1):v.toFixed(2);}
+function bytes(b){const u=['B','KB','MB','GB','TB'];let i=0;while(b>=1000&&i<4){b/=1000;i++;}return (i?b.toFixed(b>=100?0:1):b)+' '+u[i];}
+function setRange(r){trRange=r;document.querySelectorAll('#trange button').forEach(b=>b.classList.toggle('sel',b.dataset.r===r));trLast=0;loadTraffic();}
+async function loadTraffic(){trLast=Date.now();try{TR=await api('traffic',{range:trRange});drawChart();renderDays();}catch(e){}}
+function renderTraffic(s){const t=s.traffic||{};
+ $('t_down').textContent=t.on?mbit(t.down)+' Mbit/s':'–';$('t_up').textContent=t.on?mbit(t.up)+' Mbit/s':'–';
+ $('t_tdown').textContent=bytes(t.today_down||0);$('t_tup').textContent=bytes(t.today_up||0);
+ $('t_hint').textContent=t.on?'':'Keine Messung: LTE läuft nicht (Schnittstelle ogstun fehlt). Gespeicherte Historie bleibt sichtbar.';
+ if($('p-lte').classList.contains('sel')&&Date.now()-trLast>(trRange==='10m'?2000:30000))loadTraffic();}
+function renderDays(){const D=TR.days||[];$('t_days').innerHTML='<tr><th>Tag</th><th>Download</th><th>Upload</th></tr>'+D.map(d=>'<tr><td>'+esc(d[0].split('-').reverse().join('.'))+'</td><td>'+bytes(d[1])+'</td><td>'+bytes(d[2])+'</td></tr>').join('');}
+function drawChart(){const cv=$('tchart');if(!cv||!cv.clientWidth)return;const dpr=window.devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;
+ if(cv.width!==W*dpr||cv.height!==H*dpr){cv.width=W*dpr;cv.height=H*dpr;}
+ const x=cv.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,W,H);
+ const P=TR.points||[],L=46,Rm=40,T=12,B=26,w=W-L-Rm,h=H-T-B;
+ x.font='11px system-ui,sans-serif';x.fillStyle='#5d7398';
+ if(P.length<2){x.fillText('Noch keine Messwerte in diesem Zeitraum.',L+10,T+h/2);$('t_peak').textContent='–';return;}
+ let mx=Math.max(0.1,...P.map(p=>Math.max(p[1],p[2])));const st=[0.1,0.2,0.5,1,2,5,10,20,50,100,200];let step=st.find(s=>mx/s<=5)||500;mx=Math.ceil(mx/step)*step;
+ $('t_peak').textContent=mbit(Math.max(...P.map(p=>p[1])))+' Mbit/s';
+ const t0=P[0][0],t1=P[P.length-1][0],X=t=>L+(t-t0)/Math.max(1,t1-t0)*w,Y=v=>T+h-v/mx*h,Yc=v=>T+h-v/100*h;
+ x.strokeStyle='#1b2f5e';x.lineWidth=1;x.textAlign='right';
+ for(let v=0;v<=mx+1e-9;v+=step){const y=Math.round(Y(v))+.5;x.beginPath();x.moveTo(L,y);x.lineTo(L+w,y);x.stroke();x.fillText((step<1?v.toFixed(1):v)+'',L-6,y+4);}
+ x.textAlign='left';x.fillText('Mbit/s',4,T+4);x.textAlign='right';x.fillText('CPU',W-4,T+4);
+ [0,50,100].forEach(v=>x.fillText(v+'%',W-4,Yc(v)+4));
+ x.textAlign='center';const n=Math.max(2,Math.floor(w/90));
+ for(let i=0;i<=n;i++){const t=t0+(t1-t0)*i/n,d=new Date(t*1000);let s=d.toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'});if(trRange==='7d')s=d.toLocaleDateString('de-DE',{weekday:'short'})+' '+s;x.fillText(s,X(t),H-8);}
+ const line=(k,col,yf,dash)=>{x.beginPath();x.setLineDash(dash||[]);x.strokeStyle=col;x.lineWidth=dash?1:1.8;P.forEach((p,i)=>{const px=X(p[0]),py=yf(p[k]);i?x.lineTo(px,py):x.moveTo(px,py);});x.stroke();x.setLineDash([]);};
+ x.beginPath();P.forEach((p,i)=>{i?x.lineTo(X(p[0]),Y(p[1])):x.moveTo(X(p[0]),Y(p[1]));});x.lineTo(X(t1),Y(0));x.lineTo(X(t0),Y(0));x.closePath();x.fillStyle='rgba(46,196,241,.12)';x.fill();
+ line(3,'#8ea4ca',Yc,[4,3]);line(2,'#f1b24a',Y);line(1,'#2EC4F1',Y);
+ const tip=$('ttip');
+ if(trHover>=0&&trHover<P.length){const p=P[trHover],px=X(p[0]);x.strokeStyle='#5d7398';x.beginPath();x.moveTo(px+.5,T);x.lineTo(px+.5,T+h);x.stroke();
+  const d=new Date(p[0]*1000);tip.innerHTML=esc((trRange==='10m'?d.toLocaleTimeString('de-DE'):d.toLocaleString('de-DE',{weekday:'short',hour:'2-digit',minute:'2-digit'})))+'<br>↓ '+mbit(p[1])+' Mbit/s<br>↑ '+mbit(p[2])+' Mbit/s<br>CPU '+Math.round(p[3])+' %';
+  tip.style.display='block';tip.style.left=Math.min(px+10,W-tip.offsetWidth-4)+'px';tip.style.top='14px';}else tip.style.display='none';}
+(function(){const cv=$('tchart');if(!cv)return;
+ cv.addEventListener('mousemove',e=>{const P=TR.points||[];if(P.length<2)return;const r=cv.getBoundingClientRect(),L=46,w=r.width-L-40,t0=P[0][0],t1=P[P.length-1][0];
+  const t=t0+(e.clientX-r.left-L)/w*(t1-t0);let bi=0,bd=1e18;P.forEach((p,i)=>{const d=Math.abs(p[0]-t);if(d<bd){bd=d;bi=i;}});trHover=bi;drawChart();});
+ cv.addEventListener('mouseleave',()=>{trHover=-1;drawChart();});window.addEventListener('resize',drawChart);})();
 async function poll(){try{render(await api('status'));}catch(e){}}
 try{const t=localStorage.getItem('pkom_tab');if(t&&$('p-'+t))tab(t);}catch(e){}
 poll();setInterval(poll,2500);
@@ -2078,6 +2492,10 @@ def _cpu_loop():
             CPU.sample(dict(NET.procs))
         except Exception:
             pass
+        try:
+            TRAFFIC.sample(CPU.total)
+        except Exception as e:
+            log("traffic:", e)
         time.sleep(2)
 
 def main():
@@ -2086,6 +2504,7 @@ def main():
     threading.Thread(target=sms_welcome_watch, daemon=True).start()
     threading.Thread(target=lime_scan, daemon=True).start()
     threading.Thread(target=_cpu_loop, daemon=True).start()
+    threading.Thread(target=_calls_loop, daemon=True).start()
     try:
         _migrate_lte_db()
     except Exception as e:

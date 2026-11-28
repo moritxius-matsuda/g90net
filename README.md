@@ -27,6 +27,8 @@ http://<IP-des-Rechners>:8080
 - **SIM-Profil** – fertige Hex-Werte für **SPN**, **PNN** und **OPL** zum Eintragen ins eSIM-Profil.
 - **Bandauswahl** – GSM 850/900/E-900/1800/1900 und 14 LTE-FDD-Bänder (1, 2, 3, 4, 5, 7, 8, 12, 13, 17, 20, 25, 26, 28) mit Down-/Uplink-Anzeige und Prüfung, ob der Kanal ins Band passt.
 - **Neustarten einzelner Teile** – GSM, 4G komplett, nur der 4G-Funk (eNB) oder einzelne Prozesse (z. B. msc, mme), ohne das Netz anzuhalten.
+- **Anrufliste und Einzelverbindungsnachweis** – alle Gespräche über GSM (auch CSFB aus LTE) mit Von/An, Richtung, Status und Dauer; Filter nach SIM und Monat, EVN als CSV, Zielnummern auf Wunsch gekürzt.
+- **4G-Datenlast mit Historie** – Download/Upload und CPU als Kurve über 10 Minuten, 24 Stunden und 7 Tage, dazu Datenvolumen pro Tag.
 - **SIM-Daten erzeugen** – IMSI (passend zu MCC/MNC), Ki, OP und OPc (Milenage), ICCID mit Luhn-Prüfziffer, PIN/PUK/ADM1; mit einem Klick in pKOM übernehmen oder als CSV/JSON speichern.
 - **SIP-Trunk** zu einer Asterisk-Telefonanlage (osmo-sip-connector).
 - **SMS** – Willkommensnachricht beim Einbuchen und Bestätigung bei Nummernvergabe.
